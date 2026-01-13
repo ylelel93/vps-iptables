@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
 
-# 修复：如果从管道运行，重定向输入到终端
-if [[ ! -t 0 ]] && [[ -t 1 ]]; then
-    exec 0</dev/tty
-fi
-
-set -e
+# 注意：删除了 set -e
 
 VERSION="v2.0.2"
 CHAIN_PRE="IPTPF_PREROUTING"
@@ -189,13 +184,6 @@ menu() {
 ### ---------- 主循环 ----------
 main() {
   require_root
-  
-  # 确保有输出，让用户知道脚本已启动
-  echo "========================================"
-  echo "  iptables 端口转发管理脚本"
-  echo "========================================"
-  echo
-  
   while true; do
     menu
     read -rp "请选择 [0-5] (q退出): " C
