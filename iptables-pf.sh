@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
+
+# 修复：如果从管道运行，重定向输入到终端
+if [ ! -t 0 ]; then
+    exec 0</dev/tty
+fi
+
 set -e
 
-VERSION="v2.0.8-fixed"
+VERSION="v2.0.2"
 CHAIN_PRE="IPTPF_PREROUTING"
 CHAIN_POST="IPTPF_POSTROUTING"
 
@@ -183,35 +189,6 @@ menu() {
 ### ---------- 主循环 ----------
 main() {
   require_root
-  
-  # 如果是通过 bash <(...) 运行，需要特殊处理
-  if [[ ! -t 0 ]]; then
-    # 通过管道运行，需要重新打开终端
-    echo "检测到通过管道运行，正在准备交互环境..."
-    
-    # 保存脚本到临时文件
-    TMP_SCRIPT=$(mktemp /tmp/iptables-pf.XXXXXX.sh)
-    
-    # 获取当前脚本内容
-    if [[ -f /proc/self/fd/0 ]]; then
-      # 从标准输入读取脚本内容
-      cat > "$TMP_SCRIPT"
-    else
-      # 从 GitHub 重新下载
-      if command -v wget >/dev/null 2>&1; then
-        wget --no-check-certificate -q "https://raw.githubusercontent.com/ylelel93/vps-iptables/main/iptables-pf.sh" -O "$TMP_SCRIPT"
-      elif command -v curl >/dev/null 2>&1; then
-        curl -kfsSL "https://raw.githubusercontent.com/ylelel93/vps-iptables/main/iptables-pf.sh" -o "$TMP_SCRIPT"
-      fi
-    fi
-    
-    chmod +x "$TMP_SCRIPT"
-    
-    # 使用 exec 执行临时脚本（替换当前进程）
-    exec bash "$TMP_SCRIPT" "$@"
-  fi
-  
-  # 正常交互逻辑
   while true; do
     menu
     read -rp "请选择 [0-5] (q退出): " C
@@ -227,11 +204,4 @@ main() {
   done
 }
 
-# 如果通过 bash <(...) 运行，$0 会是 /dev/fd/XX，需要特殊处理
-if [[ "$0" =~ ^/dev/fd/ ]]; then
-  # 这是通过 bash <(...) 运行的情况
-  main
-else
-  # 正常文件执行
-  main "$@"
-fi
+main
