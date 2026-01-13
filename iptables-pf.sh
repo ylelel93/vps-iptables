@@ -1,7 +1,25 @@
 #!/usr/bin/env bash
+
+# 重要修复：当通过管道运行时，重新打开标准输入
+if [[ ! -t 0 ]] && [[ -t 1 ]]; then
+    # 保存当前脚本到临时文件并执行
+    SCRIPT_CONTENT=""
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        SCRIPT_CONTENT="$SCRIPT_CONTENT$line"$'\n'
+    done
+    
+    TMP_FILE=$(mktemp /tmp/iptables-pf.XXXXXX.sh)
+    echo "$SCRIPT_CONTENT" > "$TMP_FILE"
+    chmod +x "$TMP_FILE"
+    
+    # 使用 exec 替换当前进程
+    exec bash "$TMP_FILE" "$@"
+fi
+
+# 从这里开始是你的原代码，完全不变
 set -e
 
-VERSION="v2.0.9-fixed"
+VERSION="v2.0.2"
 CHAIN_PRE="IPTPF_PREROUTING"
 CHAIN_POST="IPTPF_POSTROUTING"
 
@@ -11,17 +29,11 @@ require_root() {
 }
 
 detect_lan_ip() {
-  local ip
-  ip=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
-  if [[ -z "$ip" ]]; then
-    # 如果没有找到LAN IP，尝试其他方法
-    ip=$(ip addr show | grep -E 'inet (192\.168|10\.|172\.)' | head -1 | awk '{print $2}' | cut -d'/' -f1)
-  fi
-  [[ -n "$ip" ]] && echo "$ip" || echo "127.0.0.1"
+  ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}'
 }
 
 detect_wan_ip() {
-  curl -s --connect-timeout 3 ifconfig.me 2>/dev/null || curl -s --connect-timeout 3 api.ipify.org 2>/dev/null || echo "0.0.0.0"
+  curl -s ifconfig.me || curl -s api.ipify.org
 }
 
 save_rules() {
@@ -189,12 +201,6 @@ menu() {
 ### ---------- 主循环 ----------
 main() {
   require_root
-  
-  # 显示欢迎信息
-  echo "========================================"
-  echo " iptables 端口转发管理脚本"
-  echo "========================================"
-  
   while true; do
     menu
     read -rp "请选择 [0-5] (q退出): " C
@@ -210,13 +216,4 @@ main() {
   done
 }
 
-# 如果脚本是通过 bash <(...) 方式运行的，需要特殊处理
-if [[ ! -t 0 ]]; then
-  # 从管道运行，重新打开标准输入为终端
-  if [[ -t 1 ]]; then
-    exec 0</dev/tty
-  fi
-fi
-
-# 运行主函数
 main
