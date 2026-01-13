@@ -1,22 +1,10 @@
 #!/usr/bin/env bash
 
-# 重要修复：当通过管道运行时，重新打开标准输入
+# 修复：如果从管道运行，重定向输入到终端
 if [[ ! -t 0 ]] && [[ -t 1 ]]; then
-    # 保存当前脚本到临时文件并执行
-    SCRIPT_CONTENT=""
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        SCRIPT_CONTENT="$SCRIPT_CONTENT$line"$'\n'
-    done
-    
-    TMP_FILE=$(mktemp /tmp/iptables-pf.XXXXXX.sh)
-    echo "$SCRIPT_CONTENT" > "$TMP_FILE"
-    chmod +x "$TMP_FILE"
-    
-    # 使用 exec 替换当前进程
-    exec bash "$TMP_FILE" "$@"
+    exec 0</dev/tty
 fi
 
-# 从这里开始是你的原代码，完全不变
 set -e
 
 VERSION="v2.0.2"
@@ -201,6 +189,13 @@ menu() {
 ### ---------- 主循环 ----------
 main() {
   require_root
+  
+  # 确保有输出，让用户知道脚本已启动
+  echo "========================================"
+  echo "  iptables 端口转发管理脚本"
+  echo "========================================"
+  echo
+  
   while true; do
     menu
     read -rp "请选择 [0-5] (q退出): " C
