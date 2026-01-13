@@ -1,22 +1,13 @@
 #!/usr/bin/env bash
 set -e
 
-VERSION="v2.0.7-interactive"
+VERSION="v2.0.8-fixed"
 CHAIN_PRE="IPTPF_PREROUTING"
 CHAIN_POST="IPTPF_POSTROUTING"
 
-# 颜色定义
-red='\033[0;31m'
-green='\033[0;32m'
-yellow='\033[0;33m'
-blue='\033[0;34m'
-magenta='\033[0;35m'
-cyan='\033[0;36m'
-reset='\033[0m'
-
 ### ---------- 基础 ----------
 require_root() {
-  [[ $EUID -ne 0 ]] && echo -e "${red}请使用 root 运行${reset}" && exit 1
+  [[ $EUID -ne 0 ]] && echo "请使用 root 运行" && exit 1
 }
 
 detect_lan_ip() {
@@ -24,7 +15,7 @@ detect_lan_ip() {
 }
 
 detect_wan_ip() {
-  curl -s --connect-timeout 3 ifconfig.me 2>/dev/null || curl -s --connect-timeout 3 api.ipify.org 2>/dev/null || echo "自动获取失败"
+  curl -s ifconfig.me || curl -s api.ipify.org
 }
 
 save_rules() {
@@ -37,8 +28,7 @@ save_rules() {
 
 ### ---------- 初始化 ----------
 install_and_init() {
-  clear
-  echo -e "${cyan}==> [1/4] 检查 / 安装 iptables${reset}"
+  echo "==> [1/4] 检查 / 安装 iptables"
   if ! command -v iptables >/dev/null 2>&1; then
     if command -v apt-get >/dev/null 2>&1; then
       apt-get update -y
@@ -48,18 +38,18 @@ install_and_init() {
     elif command -v dnf >/dev/null 2>&1; then
       dnf install -y iptables-services
     else
-      echo -e "${red}不支持的系统${reset}"
+      echo "不支持的系统"
       exit 1
     fi
   fi
-  echo -e "${green}[OK] iptables 已就绪${reset}"
+  echo "[OK] iptables 已就绪"
 
-  echo -e "${cyan}==> [2/4] 开启 IPv4 转发${reset}"
+  echo "==> [2/4] 开启 IPv4 转发"
   sysctl -w net.ipv4.ip_forward=1 >/dev/null
   echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-iptpf.conf
-  echo -e "${green}[OK] 转发已开启并持久化${reset}"
+  echo "[OK] 转发已开启并持久化"
 
-  echo -e "${cyan}==> [3/4] 初始化专用链（不影响系统其它规则）${reset}"
+  echo "==> [3/4] 初始化专用链（不影响系统其它规则）"
   iptables -t nat -N $CHAIN_PRE 2>/dev/null || true
   iptables -t nat -N $CHAIN_POST 2>/dev/null || true
 
@@ -67,20 +57,17 @@ install_and_init() {
     iptables -t nat -A PREROUTING -j $CHAIN_PRE
   iptables -t nat -C POSTROUTING -j $CHAIN_POST 2>/dev/null || \
     iptables -t nat -A POSTROUTING -j $CHAIN_POST
-  echo -e "${green}[OK] 专用链已挂钩${reset}"
+  echo "[OK] 专用链已挂钩"
 
-  echo -e "${cyan}==> [4/4] 保存规则${reset}"
+  echo "==> [4/4] 保存规则"
   save_rules
-  echo -e "${green}✅ 初始化 / 更新完成${reset}"
-  echo ""
-  read -n 1 -s -r -p "按任意键返回主菜单..."
+  echo "✅ 初始化 / 更新完成"
 }
 
 ### ---------- 查看 ----------
 list_rules() {
-  clear
-  echo ""
-  echo -e "${cyan}当前转发规则：${reset}"
+  echo
+  echo "当前转发规则："
   echo "------------------------------------------"
   local i=1
   iptables -t nat -S $CHAIN_PRE | grep DNAT | while read -r r; do
@@ -90,85 +77,44 @@ list_rules() {
     printf "%2d. 类型: %-4s 本地端口: %-6s 转发到: %s\n" "$i" "$proto" "$dport" "$to"
     i=$((i+1))
   done
-  [[ $i -eq 1 ]] && echo -e "${yellow}（暂无规则）${reset}"
-  echo "------------------------------------------"
-  echo ""
-  read -n 1 -s -r -p "按任意键返回主菜单..."
+  [[ $i -eq 1 ]] && echo "（暂无规则）"
 }
 
 ### ---------- 添加 ----------
 add_rule() {
-  clear
-  echo -e "${cyan}=== 添加端口转发 ===${reset}"
-  echo ""
-  
-  while true; do
-    read -rp "转发目标端口(远程端口): " RPORT
-    [[ -n "$RPORT" ]] && break
-    echo -e "${red}端口不能为空，请重新输入${reset}"
-  done
-  
-  while true; do
-    read -rp "转发目标IP: " RIP
-    [[ -n "$RIP" ]] && break
-    echo -e "${red}IP不能为空，请重新输入${reset}"
-  done
-  
+  read -rp "转发目标端口(远程端口): " RPORT
+  read -rp "转发目标IP: " RIP
   read -rp "本机监听端口 (回车=$RPORT): " LPORT
   [[ -z "$LPORT" ]] && LPORT="$RPORT"
 
-  echo ""
-  echo -e "${cyan}SNAT 源IP：${reset}"
+  echo "SNAT 源IP："
   echo " 1) 内网IP（回车自动）"
   echo " 2) 公网IP（回车自动）"
-  while true; do
-    read -rp "请选择 [1-2] (默认1): " MODE
-    [[ -z "$MODE" ]] && MODE=1
-    [[ "$MODE" == "1" || "$MODE" == "2" ]] && break
-    echo -e "${red}请选择 1 或 2${reset}"
-  done
+  read -rp "请选择 [1-2] (默认1): " MODE
+  [[ -z "$MODE" ]] && MODE=1
 
   if [[ "$MODE" == "2" ]]; then
-    SNAT_IP=$(detect_wan_ip)
-    read -rp "公网IP (回车自动=$SNAT_IP): " USER_SNAT_IP
-    [[ -n "$USER_SNAT_IP" ]] && SNAT_IP="$USER_SNAT_IP"
+    read -rp "公网IP (回车自动): " SNAT_IP
+    [[ -z "$SNAT_IP" ]] && SNAT_IP=$(detect_wan_ip)
   else
-    SNAT_IP=$(detect_lan_ip)
-    read -rp "内网IP (回车自动=$SNAT_IP): " USER_SNAT_IP
-    [[ -n "$USER_SNAT_IP" ]] && SNAT_IP="$USER_SNAT_IP"
+    read -rp "内网IP (回车自动): " SNAT_IP
+    [[ -z "$SNAT_IP" ]] && SNAT_IP=$(detect_lan_ip)
   fi
 
-  echo ""
-  echo -e "${cyan}协议类型：${reset}"
-  echo " 1) TCP"
-  echo " 2) UDP"
-  echo " 3) TCP+UDP"
-  while true; do
-    read -rp "请选择 [1-3] (默认3): " PTYPE
-    [[ -z "$PTYPE" ]] && PTYPE=3
-    [[ "$PTYPE" =~ ^[123]$ ]] && break
-    echo -e "${red}请选择 1, 2 或 3${reset}"
-  done
+  read -rp "协议类型 [1 TCP / 2 UDP / 3 TCP+UDP] (默认3): " PTYPE
+  [[ -z "$PTYPE" ]] && PTYPE=3
 
-  clear
-  echo -e "${cyan}=== 确认信息 ===${reset}"
-  echo ""
+  echo
   echo "目标地址 : $RIP:$RPORT"
-  echo "本机监听 : $LPORT"
-  echo "SNAT IP  : $SNAT_IP"
+  echo "本机     : $SNAT_IP:$LPORT"
   case $PTYPE in
     1) echo "协议类型 : TCP" ;;
     2) echo "协议类型 : UDP" ;;
-    3) echo "协议类型 : TCP + UDP" ;;
+    *) echo "协议类型 : TCP + UDP" ;;
   esac
-  echo ""
-  
+
   read -rp "确认添加？ [Y/n]: " OK
-  [[ "$OK" == "n" || "$OK" == "N" ]] && {
-    echo -e "${yellow}已取消添加${reset}"
-    sleep 1
-    return
-  }
+  [[ "$OK" == "n" || "$OK" == "N" ]] && return
 
   [[ "$PTYPE" == "1" || "$PTYPE" == "3" ]] && {
     iptables -t nat -A $CHAIN_PRE -p tcp --dport $LPORT -j DNAT --to $RIP:$RPORT
@@ -180,191 +126,112 @@ add_rule() {
   }
 
   save_rules
-  echo -e "${green}✅ 已添加并保存${reset}"
-  echo ""
-  read -n 1 -s -r -p "按任意键返回主菜单..."
+  echo "✅ 已添加并保存"
 }
 
 ### ---------- 删除 ----------
 delete_rule() {
   while true; do
-    clear
-    echo ""
-    echo -e "${cyan}当前转发规则：${reset}"
-    echo "------------------------------------------"
-    local i=1
-    iptables -t nat -S $CHAIN_PRE | grep DNAT | while read -r r; do
-      proto=$(echo "$r" | grep -oE "-p (tcp|udp)" | awk '{print toupper($2)}')
-      dport=$(echo "$r" | sed -n 's/.*--dport \([0-9]*\).*/\1/p')
-      to=$(echo "$r" | sed -n 's/.*--to-destination \([^ ]*\).*/\1/p')
-      printf "%2d. 类型: %-4s 本地端口: %-6s 转发到: %s\n" "$i" "$proto" "$dport" "$to"
-      i=$((i+1))
-    done
-    [[ $i -eq 1 ]] && {
-      echo -e "${yellow}（暂无规则）${reset}"
-      echo "------------------------------------------"
-      echo ""
-      read -n 1 -s -r -p "按任意键返回主菜单..."
-      break
-    }
-    echo "------------------------------------------"
-    echo ""
-    read -rp "请输入要删除的编号 (q返回主菜单): " IDX
-    
+    list_rules
+    echo
+    read -rp "请输入要删除的编号 (q退出): " IDX
     [[ "$IDX" == "q" ]] && break
-    
-    if ! [[ "$IDX" =~ ^[0-9]+$ ]]; then
-      echo -e "${red}请输入有效的数字${reset}"
-      sleep 1
-      continue
-    fi
-    
+
     RULE=$(iptables -t nat -S $CHAIN_PRE | grep DNAT | sed -n "${IDX}p")
-    if [[ -z "$RULE" ]]; then
-      echo -e "${red}编号不存在${reset}"
-      sleep 1
-      continue
-    fi
+    [[ -z "$RULE" ]] && continue
 
     DPORT=$(echo "$RULE" | sed -n 's/.*--dport \([0-9]*\).*/\1/p')
     TO=$(echo "$RULE" | sed -n 's/.*--to-destination \([^ ]*\).*/\1/p')
-    
-    echo ""
-    echo -e "${yellow}即将删除：端口 $DPORT -> $TO${reset}"
-    read -rp "确认删除？ [y/N]: " CONFIRM
-    
-    if [[ "$CONFIRM" == "y" || "$CONFIRM" == "Y" ]]; then
-      # 删除PREROUTING链中的规则
-      iptables -t nat -S $CHAIN_PRE | grep "--dport $DPORT" | grep "$TO" | while read -r r; do
-        iptables -t nat -D $CHAIN_PRE ${r#*-A $CHAIN_PRE }
-      done
-      
-      # 删除POSTROUTING链中的对应规则
-      iptables -t nat -S $CHAIN_POST | grep "$TO" | while read -r r; do
-        iptables -t nat -D $CHAIN_POST ${r#*-A $CHAIN_POST }
-      done
 
-      save_rules
-      echo -e "${green}✅ 已删除：$TO${reset}"
-      sleep 1
-    else
-      echo -e "${yellow}已取消删除${reset}"
-      sleep 1
-    fi
+    iptables -t nat -S $CHAIN_PRE | grep "--dport $DPORT" | grep "$TO" | while read -r r; do
+      iptables -t nat -D $CHAIN_PRE ${r#*-A $CHAIN_PRE }
+    done
+    iptables -t nat -S $CHAIN_POST | grep "$TO" | while read -r r; do
+      iptables -t nat -D $CHAIN_POST ${r#*-A $CHAIN_POST }
+    done
+
+    save_rules
+    echo "✅ 已删除：$TO"
   done
 }
 
 ### ---------- 清空 ----------
 clear_all() {
-  clear
-  echo -e "${red}=== 警告 ===${reset}"
-  echo ""
-  echo "此操作将清空本脚本管理的所有转发规则！"
-  echo ""
-  read -rp "确定要清空所有转发规则？ [y/N]: " CONFIRM
-  
-  if [[ "$CONFIRM" == "y" || "$CONFIRM" == "Y" ]]; then
-    iptables -t nat -F $CHAIN_PRE || true
-    iptables -t nat -F $CHAIN_POST || true
-    save_rules
-    echo -e "${green}✅ 已清空本脚本管理的所有规则${reset}"
-  else
-    echo -e "${yellow}已取消清空${reset}"
-  fi
-  
-  echo ""
-  read -n 1 -s -r -p "按任意键返回主菜单..."
+  iptables -t nat -F $CHAIN_PRE || true
+  iptables -t nat -F $CHAIN_POST || true
+  save_rules
+  echo "✅ 已清空本脚本管理的所有规则"
 }
 
 ### ---------- 菜单 ----------
-show_menu() {
-  clear
-  echo ""
-  echo "╔════════════════════════════════════════════╗"
-  echo "║                                            ║"
-  echo "║    iptables 端口转发一键管理脚本           ║"
-  echo "║              [$VERSION]                    ║"
-  echo "║                                            ║"
-  echo "║    -- for XiaoYu (简化可控版) --           ║"
-  echo "║                                            ║"
-  echo "╠════════════════════════════════════════════╣"
-  echo "║                                            ║"
-  echo "║  0. 升级脚本（重新下载并覆盖）             ║"
-  echo "║  ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄  ║"
-  echo "║  1. 安装 / 初始化                          ║"
-  echo "║  2. 清空 所有转发                          ║"
-  echo "║  ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄  ║"
-  echo "║  3. 查看 转发                              ║"
-  echo "║  4. 添加 转发                              ║"
-  echo "║  5. 删除 转发（循环）                      ║"
-  echo "║  ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄  ║"
-  echo "║  q. 退出                                   ║"
-  echo "║                                            ║"
-  echo "╚════════════════════════════════════════════╝"
-  echo ""
+menu() {
+  echo
+  echo "iptables 端口转发一键管理脚本 [$VERSION]"
+  echo " -- for XiaoYu (简化可控版) --"
+  echo
+  echo "0. 升级脚本（重新下载并覆盖）"
+  echo "————————————"
+  echo "1. 安装 / 初始化"
+  echo "2. 清空 所有转发"
+  echo "————————————"
+  echo "3. 查看 转发"
+  echo "4. 添加 转发"
+  echo "5. 删除 转发（循环）"
+  echo "————————————"
 }
 
 ### ---------- 主循环 ----------
 main() {
   require_root
   
-  # 检查是否已安装
-  if ! iptables -t nat -L $CHAIN_PRE &>/dev/null; then
-    clear
-    echo -e "${yellow}检测到未安装 iptables 转发规则${reset}"
-    echo ""
-    echo "是否现在安装初始化？"
-    read -rp "输入 y 安装，其他键跳过: " answer
-    if [[ "$answer" == "y" || "$answer" == "Y" ]]; then
-      install_and_init
+  # 如果是通过 bash <(...) 运行，需要特殊处理
+  if [[ ! -t 0 ]]; then
+    # 通过管道运行，需要重新打开终端
+    echo "检测到通过管道运行，正在准备交互环境..."
+    
+    # 保存脚本到临时文件
+    TMP_SCRIPT=$(mktemp /tmp/iptables-pf.XXXXXX.sh)
+    
+    # 获取当前脚本内容
+    if [[ -f /proc/self/fd/0 ]]; then
+      # 从标准输入读取脚本内容
+      cat > "$TMP_SCRIPT"
+    else
+      # 从 GitHub 重新下载
+      if command -v wget >/dev/null 2>&1; then
+        wget --no-check-certificate -q "https://raw.githubusercontent.com/ylelel93/vps-iptables/main/iptables-pf.sh" -O "$TMP_SCRIPT"
+      elif command -v curl >/dev/null 2>&1; then
+        curl -kfsSL "https://raw.githubusercontent.com/ylelel93/vps-iptables/main/iptables-pf.sh" -o "$TMP_SCRIPT"
+      fi
     fi
+    
+    chmod +x "$TMP_SCRIPT"
+    
+    # 使用 exec 执行临时脚本（替换当前进程）
+    exec bash "$TMP_SCRIPT" "$@"
   fi
   
+  # 正常交互逻辑
   while true; do
-    show_menu
+    menu
     read -rp "请选择 [0-5] (q退出): " C
     case "$C" in
-      0) 
-        clear
-        echo -e "${cyan}升级脚本${reset}"
-        echo ""
-        echo "请使用原安装链接重新下载运行以升级"
-        echo ""
-        read -n 1 -s -r -p "按任意键返回主菜单..."
-        ;;
+      0) echo "请使用原安装链接重新执行以升级";;
       1) install_and_init ;;
       2) clear_all ;;
       3) list_rules ;;
       4) add_rule ;;
       5) delete_rule ;;
-      q|Q) 
-        clear
-        echo ""
-        echo -e "${green}感谢使用，再见！${reset}"
-        echo ""
-        exit 0 
-        ;;
-      *) 
-        echo -e "${red}无效选项，请重新选择${reset}"
-        sleep 1
-        ;;
+      q) exit 0 ;;
     esac
   done
 }
 
-# 确保有交互式终端
-if [[ -t 0 ]] && [[ -t 1 ]]; then
+# 如果通过 bash <(...) 运行，$0 会是 /dev/fd/XX，需要特殊处理
+if [[ "$0" =~ ^/dev/fd/ ]]; then
+  # 这是通过 bash <(...) 运行的情况
   main
 else
-  # 如果没有交互式终端，提示用户下载到本地运行
-  echo -e "${red}错误：需要在交互式终端中运行此脚本${reset}"
-  echo ""
-  echo "请使用以下方式："
-  echo "1. 下载脚本："
-  echo "   wget --no-check-certificate https://raw.githubusercontent.com/ylelel93/vps-iptables/main/iptables-pf.sh -O iptables.sh"
-  echo "2. 添加权限："
-  echo "   chmod +x iptables.sh"
-  echo "3. 运行脚本："
-  echo "   ./iptables.sh"
-  exit 1
+  # 正常文件执行
+  main "$@"
 fi
