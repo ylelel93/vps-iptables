@@ -165,6 +165,10 @@ list_rules() {
     echo -e "\n${Info} 当前有 $i 个 iptables 端口转发规则。"
   fi
   echo "------------------------------------------"
+  
+  # 等待用户按回车键返回主菜单
+  echo ""
+  read -rp "$(echo -e ${Tip}) 按回车键返回主菜单... " enter
 }
 
 ### ---------- 添加 ----------
@@ -190,13 +194,13 @@ add_rule() {
 
   if [[ "$MODE" == "2" ]]; then
     SNAT_IP=$(detect_wan_ip)
-    echo -e "${Info} 公网IP: $SNAT_IP"
-    read -rp "$(echo -e ${Question}) 公网IP (回车使用自动检测的IP): " USER_SNAT_IP
+    echo -e "${Info} 检测到的公网IP: $SNAT_IP"
+    read -rp "$(echo -e ${Question}) 公网IP (回车使用检测到的IP): " USER_SNAT_IP
     [[ -n "$USER_SNAT_IP" ]] && SNAT_IP="$USER_SNAT_IP"
   else
     SNAT_IP=$(detect_lan_ip)
-    echo -e "${Info} 内网IP: $SNAT_IP"
-    read -rp "$(echo -e ${Question}) 内网IP (回车使用自动检测的IP): " USER_SNAT_IP
+    echo -e "${Info} 检测到的内网IP: $SNAT_IP"
+    read -rp "$(echo -e ${Question}) 内网IP (回车使用检测到的IP): " USER_SNAT_IP
     [[ -n "$USER_SNAT_IP" ]] && SNAT_IP="$USER_SNAT_IP"
   fi
 
@@ -219,6 +223,7 @@ add_rule() {
   esac
 
   read -rp "$(echo -e ${Question}) 确认添加？ [Y/n]: " OK
+  # 默认按回车或输入y/Y确认，输入n/N取消
   [[ "$OK" == "n" || "$OK" == "N" ]] && echo -e "${Tip} 已取消" && return
 
   if [[ "$PTYPE" == "1" || "$PTYPE" == "3" ]]; then
@@ -236,94 +241,155 @@ add_rule() {
 }
 
 ### ---------- 删除 ----------
+# 使用原脚本的删除逻辑，避免删除中间编号导致的问题
 delete_rule() {
   while true; do
-    echo -e "\n${Info} 当前转发规则："
-    echo "------------------------------------------"
+    echo -e "\n${Info} 删除端口转发规则"
     
-    # 获取所有规则并显示
-    local temp_file
-    temp_file=$(mktemp)
+    # 显示规则
+    list_rules_no_wait
+    
+    echo ""
+    read -rp "$(echo -e ${Question}) 请输入要删除的编号 (q退出): " IDX
+    [[ "$IDX" == "q" ]] && break
+
+    if [[ -z "$IDX" || ! "$IDX" =~ ^[0-9]+$ ]]; then
+      echo -e "${Error} 请输入有效的数字编号"
+      continue
+    fi
+    
+    # 获取对应编号的规则
+    local rule_found=false
+    local rule_line=""
+    local temp_file=$(mktemp)
     iptables -t nat -S "$CHAIN_PRE" 2>/dev/null > "$temp_file"
     
     local i=0
-    declare -a rule_list
     while read -r line; do
       if echo "$line" | grep -q "DNAT"; then
         i=$((i+1))
-        rule_list[$i]="$line"
-        
-        # 提取信息
-        local proto="TCP/UDP"
-        if echo "$line" | grep -q " -p tcp "; then
-          proto="TCP"
-        elif echo "$line" | grep -q " -p udp "; then
-          proto="UDP"
-        fi
-        
-        local dport=$(echo "$line" | sed 's/.*--dport \([0-9]*\).*/\1/')
-        local to=$(echo "$line" | sed 's/.*--to-destination \([^ ]*\).*/\1/')
-        
-        if [[ "$dport" == "$line" ]]; then
-          dport=$(echo "$line" | sed 's/.*:\([0-9]*\) .*/\1/')
-        fi
-        
-        if [[ -n "$dport" && -n "$to" ]]; then
-          printf "%2d. 类型: %-4s 监听端口: %-6s 转发IP和端口: %s\n" "$i" "$proto" "$dport" "$to"
+        if [[ $i -eq $IDX ]]; then
+          rule_found=true
+          rule_line="$line"
+          break
         fi
       fi
     done < "$temp_file"
     
     rm -f "$temp_file"
     
-    if [[ $i -eq 0 ]]; then
-      echo -e "${Tip} （暂无规则）"
-      return
+    if [[ "$rule_found" == false ]]; then
+      echo -e "${Error} 未找到编号为 $IDX 的规则"
+      continue
     fi
     
-    echo -e "\n${Info} 当前有 $i 个 iptables 端口转发规则。"
-    echo "------------------------------------------"
+    # 解析规则内容
+    local dport=$(echo "$rule_line" | sed -n 's/.*--dport \([0-9]*\).*/\1/p')
+    local to=$(echo "$rule_line" | sed -n 's/.*--to-destination \([^ ]*\).*/\1/p')
+    local rip=$(echo "$to" | cut -d: -f1)
+    local rport=$(echo "$to" | cut -d: -f2)
     
-    # 获取用户选择
-    read -rp "$(echo -e ${Question}) 请输入要删除的编号 (q退出): " IDX
-    [[ "$IDX" == "q" ]] && break
+    # 检查是否是TCP、UDP还是两者
+    local is_tcp=false
+    local is_udp=false
     
-    if [[ "$IDX" =~ ^[0-9]+$ ]] && [[ "$IDX" -ge 1 ]] && [[ "$IDX" -le $i ]]; then
-      local rule="${rule_list[$IDX]}"
+    if echo "$rule_line" | grep -q " -p tcp "; then
+      is_tcp=true
+    elif echo "$rule_line" | grep -q " -p udp "; then
+      is_udp=true
+    else
+      # 没有指定协议，则同时删除TCP和UDP
+      is_tcp=true
+      is_udp=true
+    fi
+    
+    echo -e "${Tip} 正在删除规则: $dport -> $rip:$rport"
+    
+    # 使用原脚本的删除逻辑，通过逐条匹配删除
+    if [[ "$is_tcp" == true ]]; then
+      # 删除PREROUTING链中的TCP规则
+      iptables -t nat -S "$CHAIN_PRE" 2>/dev/null | grep "DNAT" | grep "tcp" | grep "dport $dport" | grep "$to" | while read -r r; do
+        # 使用原脚本的方法删除规则
+        local delete_cmd="${r#*-A $CHAIN_PRE }"
+        iptables -t nat -D "$CHAIN_PRE" $delete_cmd 2>/dev/null || true
+      done
       
-      # 提取端口和目标地址
-      local dport=$(echo "$rule" | sed 's/.*--dport \([0-9]*\).*/\1/')
-      local to=$(echo "$rule" | sed 's/.*--to-destination \([^ ]*\).*/\1/')
+      # 删除POSTROUTING链中的TCP规则
+      iptables -t nat -S "$CHAIN_POST" 2>/dev/null | grep "tcp" | grep "$rip" | grep "dport $rport" | while read -r r; do
+        local delete_cmd="${r#*-A $CHAIN_POST }"
+        iptables -t nat -D "$CHAIN_POST" $delete_cmd 2>/dev/null || true
+      done
+    fi
+    
+    if [[ "$is_udp" == true ]]; then
+      # 删除PREROUTING链中的UDP规则
+      iptables -t nat -S "$CHAIN_PRE" 2>/dev/null | grep "DNAT" | grep "udp" | grep "dport $dport" | grep "$to" | while read -r r; do
+        local delete_cmd="${r#*-A $CHAIN_PRE }"
+        iptables -t nat -D "$CHAIN_PRE" $delete_cmd 2>/dev/null || true
+      done
       
-      echo -e "${Tip} 正在删除规则: $dport -> $to"
+      # 删除POSTROUTING链中的UDP规则
+      iptables -t nat -S "$CHAIN_POST" 2>/dev/null | grep "udp" | grep "$rip" | grep "dport $rport" | while read -r r; do
+        local delete_cmd="${r#*-A $CHAIN_POST }"
+        iptables -t nat -D "$CHAIN_POST" $delete_cmd 2>/dev/null || true
+      done
+    fi
+
+    save_rules
+    echo -e "${Info} ✅ 已删除：$to"
+  done
+}
+
+# 查看规则但不等待回车（供删除函数使用）
+list_rules_no_wait() {
+  echo -e "\n${Info} 当前转发规则："
+  echo "------------------------------------------"
+  
+  # 使用临时文件处理iptables输出，避免管道问题
+  local temp_file
+  temp_file=$(mktemp)
+  iptables -t nat -S "$CHAIN_PRE" 2>/dev/null > "$temp_file"
+  
+  local i=0
+  while read -r line; do
+    if echo "$line" | grep -q "DNAT"; then
+      i=$((i+1))
       
-      # 删除PREROUTING链中的规则
-      if echo "$rule" | grep -q " -p tcp "; then
-        iptables -t nat -D "$CHAIN_PRE" -p tcp --dport "$dport" -j DNAT --to-destination "$to" 2>/dev/null || true
-      elif echo "$rule" | grep -q " -p udp "; then
-        iptables -t nat -D "$CHAIN_PRE" -p udp --dport "$dport" -j DNAT --to-destination "$to" 2>/dev/null || true
-      else
-        # 如果没有指定协议，删除TCP和UDP两条规则
-        iptables -t nat -D "$CHAIN_PRE" -p tcp --dport "$dport" -j DNAT --to-destination "$to" 2>/dev/null || true
-        iptables -t nat -D "$CHAIN_PRE" -p udp --dport "$dport" -j DNAT --to-destination "$to" 2>/dev/null || true
+      # 提取协议类型
+      local proto="TCP/UDP"
+      if echo "$line" | grep -q " -p tcp "; then
+        proto="TCP"
+      elif echo "$line" | grep -q " -p udp "; then
+        proto="UDP"
       fi
       
-      # 删除POSTROUTING链中的规则
-      local dest_ip=$(echo "$to" | cut -d: -f1)
-      local dest_port=$(echo "$to" | cut -d: -f2)
+      # 提取端口和目标地址
+      local dport=""
+      local to=""
       
-      iptables -t nat -S "$CHAIN_POST" 2>/dev/null | grep -q "d $dest_ip.*dport $dest_port.*SNAT" && \
-        iptables -t nat -D "$CHAIN_POST" -d "$dest_ip" -p tcp --dport "$dest_port" -j SNAT 2>/dev/null || true
+      # 使用更安全的方式提取端口和地址
+      dport=$(echo "$line" | sed 's/.*--dport \([0-9]*\).*/\1/')
+      to=$(echo "$line" | sed 's/.*--to-destination \([^ ]*\).*/\1/')
       
-      iptables -t nat -S "$CHAIN_POST" 2>/dev/null | grep -q "d $dest_ip.*dport $dest_port.*SNAT" && \
-        iptables -t nat -D "$CHAIN_POST" -d "$dest_ip" -p udp --dport "$dest_port" -j SNAT 2>/dev/null || true
-
-      save_rules
-      echo -e "${Info} ✅ 已删除规则: $to"
-    else
-      echo -e "${Error} 无效的编号"
+      # 如果提取失败，尝试其他格式
+      if [[ "$dport" == "$line" ]]; then
+        dport=$(echo "$line" | sed 's/.*:\([0-9]*\) .*/\1/')
+      fi
+      
+      if [[ -n "$dport" && -n "$to" ]]; then
+        printf "%2d. 类型: %-4s 监听端口: %-6s 转发IP和端口: %s\n" "$i" "$proto" "$dport" "$to"
+      fi
     fi
-  done
+  done < "$temp_file"
+  
+  rm -f "$temp_file"
+  
+  if [[ $i -eq 0 ]]; then
+    echo -e "${Tip} （暂无规则）"
+  else
+    echo -e "\n${Info} 当前有 $i 个 iptables 端口转发规则。"
+  fi
+  echo "------------------------------------------"
 }
 
 ### ---------- 清空 ----------
@@ -342,16 +408,16 @@ clear_all() {
 show_menu() {
   clear
   echo -e " iptables 端口转发一键管理脚本 [${VERSION}]"
-  echo -e "  -- for XiaoYu (简化可控版) --"
+  echo -e "  -- Toyo | doub.io/wlzy-20 --"
   echo ""
-  echo -e " 0. 升级脚本（重新下载并覆盖）"
+  echo -e " 0. 升级脚本"
   echo -e "————————————"
-  echo -e " 1. 安装 / 初始化"
-  echo -e " 2. 清空 所有转发"
+  echo -e " 1. 安装 iptables"
+  echo -e " 2. 清空 iptables 端口转发"
   echo -e "————————————"
-  echo -e " 3. 查看 转发"
-  echo -e " 4. 添加 转发"
-  echo -e " 5. 删除 转发（循环）"
+  echo -e " 3. 查看 iptables 端口转发"
+  echo -e " 4. 添加 iptables 端口转发"
+  echo -e " 5. 删除 iptables 端口转发"
   echo -e "————————————"
   echo -e "${Tip} 注意：初次使用前请务必执行 1. 安装 iptables(不仅仅是安装)"
   echo ""
@@ -379,21 +445,29 @@ main() {
       0) 
         echo -e "${Info} 请使用原安装链接重新执行以升级"
         echo -e "${Info} wget -N --no-check-certificate https://raw.githubusercontent.com/ylelel93/vps-iptables/main/iptables-pf.sh && chmod +x iptables-pf.sh && bash iptables-pf.sh"
+        echo ""
+        read -rp "$(echo -e ${Tip}) 按回车键返回主菜单... " enter
         ;;
       1) 
-        install_and_init 
+        install_and_init
+        echo ""
+        read -rp "$(echo -e ${Tip}) 按回车键返回主菜单... " enter
         ;;
       2) 
-        clear_all 
+        clear_all
+        echo ""
+        read -rp "$(echo -e ${Tip}) 按回车键返回主菜单... " enter
         ;;
       3) 
-        list_rules 
+        list_rules
         ;;
       4) 
-        add_rule 
+        add_rule
+        echo ""
+        read -rp "$(echo -e ${Tip}) 按回车键返回主菜单... " enter
         ;;
       5) 
-        delete_rule 
+        delete_rule
         ;;
       q) 
         echo -e "${Info} 感谢使用！"
@@ -401,12 +475,10 @@ main() {
         ;;
       *) 
         echo -e "${Error} 无效选择，请重新输入"
+        echo ""
+        read -rp "$(echo -e ${Tip}) 按回车键继续... " enter
         ;;
     esac
-    
-    echo ""
-    read -rp "$(echo -e ${Tip}) 按回车键继续..." -t 1 || true
-    echo ""
   done
 }
 
