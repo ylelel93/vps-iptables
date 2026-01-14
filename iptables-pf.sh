@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-VERSION="v1.1.1"
+VERSION="v2.0"
 CHAIN_PRE="IPTPF_PREROUTING"
 CHAIN_POST="IPTPF_POSTROUTING"
 
@@ -165,10 +165,6 @@ list_rules() {
     echo -e "\n${Info} 当前有 $i 个 iptables 端口转发规则。"
   fi
   echo "------------------------------------------"
-  
-  # 等待用户按回车键返回主菜单
-  echo ""
-  read -rp "$(echo -e ${Tip}) 按回车键返回主菜单... " enter
 }
 
 ### ---------- 添加 ----------
@@ -224,7 +220,10 @@ add_rule() {
 
   read -rp "$(echo -e ${Question}) 确认添加？ [Y/n]: " OK
   # 默认按回车或输入y/Y确认，输入n/N取消
-  [[ "$OK" == "n" || "$OK" == "N" ]] && echo -e "${Tip} 已取消" && return
+  if [[ "$OK" == "n" || "$OK" == "N" ]]; then
+    echo -e "${Tip} 已取消"
+    return
+  fi
 
   if [[ "$PTYPE" == "1" || "$PTYPE" == "3" ]]; then
     iptables -t nat -A "$CHAIN_PRE" -p tcp --dport "$LPORT" -j DNAT --to-destination "$RIP:$RPORT"
@@ -240,8 +239,130 @@ add_rule() {
   echo -e "${Info} ✅ 已添加并保存"
 }
 
+### ---------- 批量添加 ----------
+add_batch_rules() {
+  echo -e "${Info} 批量添加端口转发规则"
+  echo "------------------------------------------"
+  echo -e "${Tip} 格式说明：本机IP:端口=目标IP:端口"
+  echo -e "${Tip} 示例：1.1.1.1:11=2.2.2.2:22"
+  echo -e "${Tip} 每行一个规则，输入空行结束"
+  echo "------------------------------------------"
+  
+  # 读取批量规则
+  local rules=()
+  echo -e "${Tip} 请输入规则 (输入空行结束):"
+  
+  local i=1
+  while true; do
+    read -rp "$(echo -e ${Question}) 规则${i}: " rule
+    [[ -z "$rule" ]] && break
+    
+    # 验证规则格式
+    if ! echo "$rule" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+=[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$'; then
+      echo -e "${Error} 格式错误，请使用格式: 本机IP:端口=目标IP:端口"
+      continue
+    fi
+    
+    rules+=("$rule")
+    i=$((i+1))
+  done
+  
+  if [[ ${#rules[@]} -eq 0 ]]; then
+    echo -e "${Error} 未输入任何规则"
+    return 1
+  fi
+  
+  echo -e "\n${Info} 已输入 ${#rules[@]} 条规则"
+  
+  # SNAT选择
+  echo -e "\n${Tip} SNAT源IP（将应用于所有规则）："
+  echo " 1) 内网IP（回车自动）"
+  echo " 2) 公网IP（回车自动）"
+  read -rp "$(echo -e ${Question}) 请选择 [1-2] (默认1): " MODE
+  [[ -z "$MODE" ]] && MODE=1
+
+  if [[ "$MODE" == "2" ]]; then
+    SNAT_IP=$(detect_wan_ip)
+    echo -e "${Info} 检测到的公网IP: $SNAT_IP"
+    read -rp "$(echo -e ${Question}) 公网IP (回车使用检测到的IP): " USER_SNAT_IP
+    [[ -n "$USER_SNAT_IP" ]] && SNAT_IP="$USER_SNAT_IP"
+  else
+    SNAT_IP=$(detect_lan_ip)
+    echo -e "${Info} 检测到的内网IP: $SNAT_IP"
+    read -rp "$(echo -e ${Question}) 内网IP (回车使用检测到的IP): " USER_SNAT_IP
+    [[ -n "$USER_SNAT_IP" ]] && SNAT_IP="$USER_SNAT_IP"
+  fi
+
+  read -rp "$(echo -e ${Question}) 协议类型 [1 TCP / 2 UDP / 3 TCP+UDP] (默认3): " PTYPE
+  [[ -z "$PTYPE" ]] && PTYPE=3
+
+  # 验证IP是否为IPv4
+  if ! [[ "$SNAT_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo -e "${Error} 检测到的IP '$SNAT_IP' 不是有效的IPv4地址"
+    return 1
+  fi
+
+  # 显示所有规则
+  echo -e "\n${Info} 批量添加规则摘要:"
+  echo " SNAT地址 : $SNAT_IP"
+  case $PTYPE in
+    1) echo " 协议类型 : TCP" ;;
+    2) echo " 协议类型 : UDP" ;;
+    *) echo " 协议类型 : TCP + UDP" ;;
+  esac
+  echo "------------------------------------------"
+  
+  for ((i=0; i<${#rules[@]}; i++)); do
+    local rule="${rules[$i]}"
+    local local_ip="${rule%%:*}"
+    local rest="${rule#*:}"
+    local local_port="${rest%%=*}"
+    local target_part="${rest#*=}"
+    local target_ip="${target_part%%:*}"
+    local target_port="${target_part#*:}"
+    
+    echo " $((i+1)). 本机 $local_ip:$local_port -> 目标 $target_ip:$target_port"
+  done
+  echo "------------------------------------------"
+
+  read -rp "$(echo -e ${Question}) 确认添加所有规则？ [Y/n]: " OK
+  if [[ "$OK" == "n" || "$OK" == "N" ]]; then
+    echo -e "${Tip} 已取消"
+    return
+  fi
+
+  # 添加所有规则
+  local success_count=0
+  for ((i=0; i<${#rules[@]}; i++)); do
+    local rule="${rules[$i]}"
+    local local_ip="${rule%%:*}"
+    local rest="${rule#*:}"
+    local local_port="${rest%%=*}"
+    local target_part="${rest#*=}"
+    local target_ip="${target_part%%:*}"
+    local target_port="${target_part#*:}"
+    
+    echo -e "${Info} 添加规则: $local_ip:$local_port -> $target_ip:$target_port"
+    
+    # 使用SNAT_IP作为SNAT地址
+    if [[ "$PTYPE" == "1" || "$PTYPE" == "3" ]]; then
+      iptables -t nat -A "$CHAIN_PRE" -p tcp --dport "$local_port" -j DNAT --to-destination "$target_ip:$target_port"
+      iptables -t nat -A "$CHAIN_POST" -p tcp -d "$target_ip" --dport "$target_port" -j SNAT --to-source "$SNAT_IP"
+    fi
+    
+    if [[ "$PTYPE" == "2" || "$PTYPE" == "3" ]]; then
+      iptables -t nat -A "$CHAIN_PRE" -p udp --dport "$local_port" -j DNAT --to-destination "$target_ip:$target_port"
+      iptables -t nat -A "$CHAIN_POST" -p udp -d "$target_ip" --dport "$target_port" -j SNAT --to-source "$SNAT_IP"
+    fi
+    
+    success_count=$((success_count+1))
+  done
+
+  save_rules
+  echo -e "${Info} ✅ 批量添加完成，成功添加 $success_count 条规则"
+}
+
 ### ---------- 删除 ----------
-# 使用原脚本的删除逻辑，避免删除中间编号导致的问题
 delete_rule() {
   while true; do
     echo -e "\n${Info} 删除端口转发规则"
@@ -305,11 +426,10 @@ delete_rule() {
     
     echo -e "${Tip} 正在删除规则: $dport -> $rip:$rport"
     
-    # 使用原脚本的删除逻辑，通过逐条匹配删除
+    # 使用安全的删除逻辑
     if [[ "$is_tcp" == true ]]; then
       # 删除PREROUTING链中的TCP规则
       iptables -t nat -S "$CHAIN_PRE" 2>/dev/null | grep "DNAT" | grep "tcp" | grep "dport $dport" | grep "$to" | while read -r r; do
-        # 使用原脚本的方法删除规则
         local delete_cmd="${r#*-A $CHAIN_PRE }"
         iptables -t nat -D "$CHAIN_PRE" $delete_cmd 2>/dev/null || true
       done
@@ -336,7 +456,7 @@ delete_rule() {
     fi
 
     save_rules
-    echo -e "${Info} ✅ 已删除：$to"
+    echo -e "${Info} ✅ 已删除规则: $to"
   done
 }
 
@@ -408,7 +528,7 @@ clear_all() {
 show_menu() {
   clear
   echo -e " iptables 端口转发一键管理脚本 [${VERSION}]"
-  echo -e "  -- Toyo | doub.io/wlzy-202 --"
+  echo -e "  -- Toyo | doub.io/wlzy-20 --"
   echo ""
   echo -e " 0. 升级脚本"
   echo -e "————————————"
@@ -417,20 +537,11 @@ show_menu() {
   echo -e "————————————"
   echo -e " 3. 查看 iptables 端口转发"
   echo -e " 4. 添加 iptables 端口转发"
-  echo -e " 5. 删除 iptables 端口转发"
+  echo -e " 5. 批量添加 iptables 端口转发"
+  echo -e " 6. 删除 iptables 端口转发"
   echo -e "————————————"
   echo -e "${Tip} 注意：初次使用前请务必执行 1. 安装 iptables(不仅仅是安装)"
   echo ""
-}
-
-### ---------- 系统信息 ----------
-show_info() {
-  echo -e "\n${Info} 系统信息："
-  echo "------------------------------------------"
-  echo -e " 内网IPv4: $(detect_lan_ip)"
-  echo -e " 公网IPv4: $(detect_wan_ip)"
-  echo -e " IPv4转发状态: $(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo '未知')"
-  echo "------------------------------------------"
 }
 
 ### ---------- 主循环 ----------
@@ -439,7 +550,7 @@ main() {
   
   while true; do
     show_menu
-    read -rp "$(echo -e ${Question}) 请输入数字 [0-5]: " C
+    read -rp "$(echo -e ${Question}) 请输入数字 [0-6] (q退出): " C
     
     case "$C" in
       0) 
@@ -460,6 +571,9 @@ main() {
         ;;
       3) 
         list_rules
+        # 这里等待回车
+        echo ""
+        read -rp "$(echo -e ${Tip}) 按回车键返回主菜单... " enter
         ;;
       4) 
         add_rule
@@ -467,6 +581,11 @@ main() {
         read -rp "$(echo -e ${Tip}) 按回车键返回主菜单... " enter
         ;;
       5) 
+        add_batch_rules
+        echo ""
+        read -rp "$(echo -e ${Tip}) 按回车键返回主菜单... " enter
+        ;;
+      6) 
         delete_rule
         ;;
       q) 
