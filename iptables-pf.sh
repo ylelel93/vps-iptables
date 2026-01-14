@@ -408,7 +408,7 @@ clear_all() {
 show_menu() {
   clear
   echo -e " iptables 端口转发一键管理脚本 [${VERSION}]"
-  echo -e "  -- Toyo | doub.io/wlzy-20 --"
+  echo -e "  -- Toyo | doub.io/wlzy-202 --"
   echo ""
   echo -e " 0. 升级脚本"
   echo -e "————————————"
