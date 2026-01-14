@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-VERSION="v2.0"
+VERSION="v2.1"
 CHAIN_PRE="IPTPF_PREROUTING"
 CHAIN_POST="IPTPF_POSTROUTING"
 
@@ -218,7 +218,7 @@ add_rule() {
     *) echo " 协议类型 : TCP + UDP" ;;
   esac
 
-  read -rp "$(echo -e ${Question}) 确认添加？ [Y/n]: " OK
+  read -rp "$(echo -e ${Question}) 确认添加？ [Y/n]: （回车默认选Y） " OK
   # 默认按回车或输入y/Y确认，输入n/N取消
   if [[ "$OK" == "n" || "$OK" == "N" ]]; then
     echo -e "${Tip} 已取消"
@@ -245,16 +245,24 @@ add_batch_rules() {
   echo "------------------------------------------"
   echo -e "${Tip} 格式说明：本机IP:端口=目标IP:端口"
   echo -e "${Tip} 示例：1.1.1.1:11=2.2.2.2:22"
-  echo -e "${Tip} 每行一个规则，输入空行结束"
+  echo -e "${Tip} 每行一个规则，输入空行结束，输入 q 返回主菜单"
   echo "------------------------------------------"
   
   # 读取批量规则
   local rules=()
-  echo -e "${Tip} 请输入规则 (输入空行结束):"
+  echo -e "${Tip} 请输入规则 (输入空行结束，输入 q 返回主菜单):"
   
   local i=1
   while true; do
     read -rp "$(echo -e ${Question}) 规则${i}: " rule
+    
+    # 检查是否输入q返回主菜单
+    if [[ "$rule" == "q" || "$rule" == "Q" ]]; then
+      echo -e "${Tip} 返回主菜单"
+      return 1
+    fi
+    
+    # 检查是否输入空行结束
     [[ -z "$rule" ]] && break
     
     # 验证规则格式
@@ -274,25 +282,34 @@ add_batch_rules() {
   
   echo -e "\n${Info} 已输入 ${#rules[@]} 条规则"
   
-  # SNAT选择
-  echo -e "\n${Tip} SNAT源IP（将应用于所有规则）："
-  echo " 1) 内网IP（回车自动）"
-  echo " 2) 公网IP（回车自动）"
-  read -rp "$(echo -e ${Question}) 请选择 [1-2] (默认1): " MODE
-  [[ -z "$MODE" ]] && MODE=1
-
-  if [[ "$MODE" == "2" ]]; then
-    SNAT_IP=$(detect_wan_ip)
-    echo -e "${Info} 检测到的公网IP: $SNAT_IP"
-    read -rp "$(echo -e ${Question}) 公网IP (回车使用检测到的IP): " USER_SNAT_IP
-    [[ -n "$USER_SNAT_IP" ]] && SNAT_IP="$USER_SNAT_IP"
-  else
-    SNAT_IP=$(detect_lan_ip)
-    echo -e "${Info} 检测到的内网IP: $SNAT_IP"
-    read -rp "$(echo -e ${Question}) 内网IP (回车使用检测到的IP): " USER_SNAT_IP
-    [[ -n "$USER_SNAT_IP" ]] && SNAT_IP="$USER_SNAT_IP"
+  # 从第一条规则中提取SNAT IP（本机IP）
+  local first_rule="${rules[0]}"
+  local local_ip="${first_rule%%:*}"
+  echo -e "${Info} 将使用第一条规则的本地IP作为SNAT地址: $local_ip"
+  
+  # 验证所有规则的本机IP是否相同
+  local all_same=true
+  for ((i=1; i<${#rules[@]}; i++)); do
+    local rule="${rules[$i]}"
+    local current_local_ip="${rule%%:*}"
+    if [[ "$current_local_ip" != "$local_ip" ]]; then
+      all_same=false
+      echo -e "${Error} 警告: 规则$((i+1))的本机IP($current_local_ip)与第一条规则的本机IP($local_ip)不同"
+    fi
+  done
+  
+  if [[ "$all_same" == false ]]; then
+    echo -e "${Tip} 检测到不同本机IP，将使用第一条规则的本机IP($local_ip)作为SNAT地址"
+    read -rp "$(echo -e ${Question}) 是否继续？ [Y/n]: （回车默认选Y） " continue_choice
+    if [[ "$continue_choice" == "n" || "$continue_choice" == "N" ]]; then
+      echo -e "${Tip} 已取消"
+      return 1
+    fi
   fi
-
+  
+  # SNAT IP就是本机IP
+  SNAT_IP="$local_ip"
+  
   read -rp "$(echo -e ${Question}) 协议类型 [1 TCP / 2 UDP / 3 TCP+UDP] (默认3): " PTYPE
   [[ -z "$PTYPE" ]] && PTYPE=3
 
@@ -325,7 +342,7 @@ add_batch_rules() {
   done
   echo "------------------------------------------"
 
-  read -rp "$(echo -e ${Question}) 确认添加所有规则？ [Y/n]: " OK
+  read -rp "$(echo -e ${Question}) 确认添加所有规则？ [Y/n]: （回车默认选Y） " OK
   if [[ "$OK" == "n" || "$OK" == "N" ]]; then
     echo -e "${Tip} 已取消"
     return
@@ -344,7 +361,7 @@ add_batch_rules() {
     
     echo -e "${Info} 添加规则: $local_ip:$local_port -> $target_ip:$target_port"
     
-    # 使用SNAT_IP作为SNAT地址
+    # 使用规则中的本机IP作为SNAT地址
     if [[ "$PTYPE" == "1" || "$PTYPE" == "3" ]]; then
       iptables -t nat -A "$CHAIN_PRE" -p tcp --dport "$local_port" -j DNAT --to-destination "$target_ip:$target_port"
       iptables -t nat -A "$CHAIN_POST" -p tcp -d "$target_ip" --dport "$target_port" -j SNAT --to-source "$SNAT_IP"
