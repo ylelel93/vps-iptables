@@ -1,7 +1,18 @@
 #!/bin/bash
 # ============================================
 # iptables 端口转发管理脚本 v3.0
-# 2006-8-4
+# 主要改进:
+#   [bug]  基于 comment 标签的 DNAT/SNAT 精确配对 (根治跨规则误删)
+#   [bug]  批量添加使用每条规则自己的本机 IP 作 SNAT
+#   [bug]  重复添加检测 (iptables -C)
+#   [新增] 输入校验 / 备注 / 批量删除(1,3,5-8) / 导入导出
+#   [新增] firewalld / ufw 冲突检测；多网卡提示
+#   [新增] flock 并发锁；iptables -w 等待 xtables lock
+#   [新增] iptables backend (legacy/nft) 检测
+#   [新增] 内核模块自动加载
+#   [新增] 操作日志 /var/log/iptpf.log
+#   [新增] 命令行子命令模式 (add / del / list / import / export / init)
+#   [新增] clear_all 可选移除主链钩子
 # ============================================
 
 set -euo pipefail
@@ -465,36 +476,48 @@ interactive_add() {
 }
 
 interactive_batch_add() {
-  echo -e "\n${Info} 批量添加"
-  echo "------------------------------------------"
-  echo -e "${Tip} 格式:  本机IP:端口=目标IP:端口"
-  echo -e "${Tip} 例如:  1.1.1.1:11=2.2.2.2:22"
-  echo -e "${Tip} 空行结束; 输入 q 返回"
-  echo "------------------------------------------"
+  echo ""
+  echo "  ═══════════════════════════════════════════════════════════"
+  echo "     批量添加转发规则"
+  echo "  ═══════════════════════════════════════════════════════════"
+  echo "     格式:  本机IP:端口=目标IP:端口"
+  echo "     示例:  10.0.0.1:22=1.2.3.4:22"
+  echo "     结束:  【空行 + 回车】表示输完，进入下一步"
+  echo "     取消:  输入 q + 回车"
+  echo "  ───────────────────────────────────────────────────────────"
 
-  local rules=() rule i=1
+  local rules=() rule i=1 rejected=0
   local _lip _lport _rip _rport _rest
   while true; do
-    read -rp "$(echo -e ${Ask}) 规则 ${i}: " rule
-    [[ "$rule" == "q" || "$rule" == "Q" ]] && return 1
-    [[ -z "$rule" ]] && break
+    read -rp "  [${i}]> " rule
+    if [[ "$rule" == "q" || "$rule" == "Q" ]]; then
+      log "${Tip} 已取消"; return 1
+    fi
+    if [[ -z "$rule" ]]; then break; fi
+
     if ! [[ "$rule" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]+=([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]+$ ]]; then
-      log "${Error} 格式错误 (应为 本机IP:端口=目标IP:端口)"
+      echo -e "        ${Error} 格式错误 (需为 IP:端口=IP:端口，注意不要有空格)"
+      rejected=$((rejected+1))
       continue
     fi
-    # 逐行深度校验：拦下 999.999.999.999 / 端口 > 65535 / 前导零之类
     _lip="${rule%%:*}"; _rest="${rule#*:}"
     _lport="${_rest%%=*}"; _rest="${_rest#*=}"
     _rip="${_rest%%:*}"; _rport="${_rest#*:}"
-    if   ! validate_ip   "$_lip";   then log "${Error} 本机 IP 非法: $_lip";       continue
-    elif ! validate_ip   "$_rip";   then log "${Error} 目标 IP 非法: $_rip";       continue
-    elif ! validate_port "$_lport"; then log "${Error} 本机端口非法: $_lport";     continue
-    elif ! validate_port "$_rport"; then log "${Error} 目标端口非法: $_rport";     continue
+    if   ! validate_ip   "$_lip";   then echo -e "        ${Error} 本机 IP 非法: $_lip";   rejected=$((rejected+1)); continue
+    elif ! validate_ip   "$_rip";   then echo -e "        ${Error} 目标 IP 非法: $_rip";   rejected=$((rejected+1)); continue
+    elif ! validate_port "$_lport"; then echo -e "        ${Error} 本机端口非法: $_lport"; rejected=$((rejected+1)); continue
+    elif ! validate_port "$_rport"; then echo -e "        ${Error} 目标端口非法: $_rport"; rejected=$((rejected+1)); continue
     fi
     rules+=("$rule")
     i=$((i+1))
   done
-  (( ${#rules[@]} == 0 )) && { log "${Tip} 未输入任何规则"; return; }
+
+  echo ""
+  echo "  ───────────────────────────────────────────────────────────"
+  echo "     输入完毕：接收 ${#rules[@]} 条  /  拒绝 ${rejected} 条"
+  echo "  ───────────────────────────────────────────────────────────"
+
+  (( ${#rules[@]} == 0 )) && { log "${Tip} 无有效规则，返回菜单"; return; }
 
   local PTYPE proto REMARK OK
   read -rp "$(echo -e ${Ask}) 协议 [1=TCP 2=UDP 3=TCP+UDP] (默认 3): " PTYPE
@@ -534,32 +557,85 @@ interactive_batch_add() {
 }
 
 ### ---------- 列表 ----------
-_print_rules_table() {
-  local tags=() tag
-  while IFS= read -r tag; do tags+=("$tag"); done < <(_list_tags)
 
-  if (( ${#tags[@]} == 0 )); then
-    echo -e "${Tip} （暂无规则）"
+# 全局: 显示行 → 底层 tag(s) 的映射
+# 每项格式: proto|lport|rip|rport|snat|remark|tag1[|tag2]
+_DISPLAY_MAP=()
+
+# 把 _list_tags 输出的原始 tag 列表加工成显示行，同 lport+目标 的 tcp/udp 合并为一行
+_build_display_map() {
+  _DISPLAY_MAP=()
+  local -a raw=()
+  local t
+  while IFS= read -r t; do raw+=("$t"); done < <(_list_tags)
+  local n="${#raw[@]}"
+  (( n == 0 )) && return 0
+
+  local -a paired=()
+  local i j
+  local lp1 pr1 rip1 rpt1 sn1 rm1 lp2 pr2 rip2 rpt2 sn2 rm2 partner
+  for ((i=0; i<n; i++)); do
+    [[ "${paired[i]:-0}" == "1" ]] && continue
+    IFS=$'\t' read -r lp1 pr1 rip1 rpt1 sn1 rm1 < <(_parse_tag "${raw[i]}")
+    partner=""
+    for ((j=i+1; j<n; j++)); do
+      [[ "${paired[j]:-0}" == "1" ]] && continue
+      IFS=$'\t' read -r lp2 pr2 rip2 rpt2 sn2 rm2 < <(_parse_tag "${raw[j]}")
+      if [[ "$lp1" == "$lp2" && "$rip1" == "$rip2" && "$rpt1" == "$rpt2" \
+         && "$sn1" == "$sn2" && "$rm1" == "$rm2" && "$pr1" != "$pr2" ]]; then
+        partner="${raw[j]}"
+        paired[j]=1
+        break
+      fi
+    done
+    if [[ -n "$partner" ]]; then
+      _DISPLAY_MAP+=("both|${lp1}|${rip1}|${rpt1}|${sn1}|${rm1}|${raw[i]}|${partner}")
+    else
+      _DISPLAY_MAP+=("${pr1}|${lp1}|${rip1}|${rpt1}|${sn1}|${rm1}|${raw[i]}")
+    fi
+    paired[i]=1
+  done
+}
+
+_print_rules_table() {
+  _build_display_map
+  local n="${#_DISPLAY_MAP[@]}"
+  if (( n == 0 )); then
+    echo "     (暂无规则)"
     return 1
   fi
 
-  printf "%-4s %-6s %-24s %-24s %-16s %s\n" "序号" "协议" "监听" "目标" "SNAT" "备注"
-  echo "----------------------------------------------------------------------------------------------"
-  local i=0 lport proto rip rport snat remark
-  for tag in "${tags[@]}"; do
-    i=$((i+1))
-    IFS=$'\t' read -r lport proto rip rport snat remark < <(_parse_tag "$tag")
-    printf "%-4d %-6s %-24s %-24s %-16s %s\n" \
-      "$i" "$proto" "0.0.0.0:${lport}" "${rip}:${rport}" "$snat" "${remark:-}"
+  # 表头
+  printf "  %-4s %-8s %-8s   %-24s %-16s %s\n" "编号" "协议" "监听端口" "→ 目标 (IP:端口)" "SNAT源 IP" "备注"
+  printf "  %s\n" "-----------------------------------------------------------------------------------------"
+
+  local i entry proto lport rip rport snat remark proto_disp
+  for ((i=0; i<n; i++)); do
+    entry="${_DISPLAY_MAP[i]}"
+    IFS='|' read -r proto lport rip rport snat remark _ _ <<< "$entry"
+    case "$proto" in
+      both) proto_disp="TCP+UDP" ;;
+      tcp)  proto_disp="TCP" ;;
+      udp)  proto_disp="UDP" ;;
+      *)    proto_disp="$proto" ;;
+    esac
+    printf "  %-4d %-8s %-8s → %-24s %-16s %s\n" \
+      "$((i+1))" "$proto_disp" "$lport" "${rip}:${rport}" "$snat" "${remark:-}"
+    # 每 10 行插一条淡分隔，便于扫读
+    if (( (i+1) % 10 == 0 && i+1 < n )); then
+      printf "  %s\n" "· · · · · · · · · · · · · · · · · · · · · · · · · · · · · · · · · · · ·"
+    fi
   done
   return 0
 }
 
 list_rules() {
-  echo -e "\n${Info} 当前转发规则:"
-  echo "----------------------------------------------------------------------------------------------"
+  echo ""
+  echo "  ═══════════════════════════════════════════════════════════"
+  echo "     当前转发规则 (TCP+UDP 同目标已合并为一条)"
+  echo "  ═══════════════════════════════════════════════════════════"
   _print_rules_table || true
-  echo "----------------------------------------------------------------------------------------------"
+  echo "  -----------------------------------------------------------"
 
   local legacy; legacy=$(_count_legacy_rules)
   if (( legacy > 0 )); then
@@ -633,44 +709,48 @@ _expand_indices() {
 }
 
 interactive_delete() {
-  local IDX tags nums n tag
+  local IDX nums n entry
   while true; do
     echo ""
     _print_rules_table || { echo ""; return; }
     echo ""
-    echo -e "${Tip} 支持: 单个(3) / 范围(1-3) / 组合(1,3,5-8) / all / q 退出"
-    read -rp "$(echo -e ${Ask}) 删除编号: " IDX
+    echo "  ───────────────────────────────────────────────────────────"
+    echo "     支持: 单个(3) / 范围(1-3) / 组合(1,3,5-8) / all / q 退出"
+    read -rp "  >>> 删除编号: " IDX
     [[ "$IDX" == "q" || "$IDX" == "Q" ]] && break
     [[ -z "$IDX" ]] && continue
 
-    tags=()
-    while IFS= read -r tag; do tags+=("$tag"); done < <(_list_tags)
-    local total="${#tags[@]}"
+    # 按显示行数(合并后)工作
+    local total="${#_DISPLAY_MAP[@]}"
     (( total == 0 )) && break
 
     if ! nums=$(_expand_indices "$IDX" "$total"); then
-      log "${Error} 编号格式错误或越界 (当前共 $total 条)"
+      log "${Error} 编号格式错误或越界 (当前共 $total 行)"
       continue
     fi
 
-    # 危险操作二次确认：输入含 all 或选中了全部规则
     local sel_count C2
     sel_count=$(echo "$nums" | grep -c .)
     if [[ "$IDX" =~ [aA][lL][lL] ]] || (( sel_count == total )); then
-      echo -e "${Warn} 即将删除全部 ${total} 条规则！"
-      read -rp "$(echo -e ${Ask}) 确认? [y/N]: " C2
+      echo ""
+      echo "  ⚠  即将删除全部 ${total} 行规则！"
+      read -rp "  >>> 请输入 y 并回车确认，其它任何输入(含回车)将取消: " C2
       if [[ "$C2" != "y" && "$C2" != "Y" ]]; then
         log "${Tip} 已取消"
         continue
       fi
     fi
 
-    # 从大到小删除，避免影响序号（此处按 tag 数组下标不受影响，但保持惯例）
-    local nums_desc
+    local nums_desc t1 t2
     nums_desc=$(echo "$nums" | sort -rn)
     while IFS= read -r n; do
       [[ -z "$n" ]] && continue
-      _delete_by_tag "${tags[n-1]}"
+      entry="${_DISPLAY_MAP[n-1]}"
+      # 底层 tag 可能是 1 个(单协议)或 2 个(tcp+udp 合并)
+      t1=$(echo "$entry" | awk -F'|' '{print $7}')
+      t2=$(echo "$entry" | awk -F'|' '{print $8}')
+      [[ -n "$t1" ]] && _delete_by_tag "$t1"
+      [[ -n "$t2" ]] && _delete_by_tag "$t2"
     done <<< "$nums_desc"
 
     save_rules
@@ -789,11 +869,23 @@ _ipv6_status() {
 }
 
 disable_ipv6() {
-  echo -e "${Warn} 将从内核禁用 IPv6，并清除所有网卡上的 IPv6 地址"
-  echo -e "${Tip} 当前状态: $(_ipv6_status)"
+  echo ""
+  echo "  ═══════════════════════════════════════════════"
+  echo "     即将执行: 禁用 IPv6"
+  echo "  ═══════════════════════════════════════════════"
+  echo "     当前状态: $(_ipv6_status)"
+  echo "     影响    : 清除所有 IPv6 地址、屏蔽 IPv6 流量"
+  echo "     持久化  : 写入 $IPV6_CONF_FILE (重启后保持)"
+  echo "     可恢复  : 菜单 11 或 sudo $CMD_NAME enable-ipv6"
+  echo "  ───────────────────────────────────────────────"
   local C
-  read -rp "$(echo -e ${Ask}) 确认禁用? [y/N]: " C
-  [[ "$C" != "y" && "$C" != "Y" ]] && { log "${Tip} 已取消"; return; }
+  echo ""
+  read -rp "  >>> 请输入 y 并回车确认，其它任何输入(含回车)将取消: " C
+  echo ""
+  if [[ "$C" != "y" && "$C" != "Y" ]]; then
+    log "${Tip} 已取消 (你输入的是 '${C}')"
+    return
+  fi
 
   # 1. 立即从内核生效
   sysctl -w net.ipv6.conf.all.disable_ipv6=1     >/dev/null || die "sysctl 写入失败"
@@ -835,106 +927,114 @@ EOF
 }
 
 check_ipv6() {
-  echo -e "\n${Info} ============ IPv6 状态复核 ============"
-  local issues=0
+  # 收集所有数据 (静默)
+  local all_v def_v lo_v
+  all_v=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo "?")
+  def_v=$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null || echo "?")
+  lo_v=$(sysctl -n net.ipv6.conf.lo.disable_ipv6 2>/dev/null || echo "?")
 
-  # [1] sysctl 三个关键值
-  echo -e "\n${Info} [1] 内核 sysctl:"
-  local k v
-  for k in net.ipv6.conf.all.disable_ipv6 net.ipv6.conf.default.disable_ipv6 net.ipv6.conf.lo.disable_ipv6; do
-    v=$(sysctl -n "$k" 2>/dev/null || echo "?")
-    if [[ "$v" == "1" ]]; then
-      printf "     [OK]   %-45s = %s\n" "$k" "$v"
-    else
-      printf "     [WARN] %-45s = %s   <-- 未禁用\n" "$k" "$v"
-      issues=$((issues+1))
-    fi
-  done
+  local conf_ok=0
+  [[ -f "$IPV6_CONF_FILE" ]] && conf_ok=1
 
-  # [2] 持久化配置
-  echo -e "\n${Info} [2] 持久化配置文件:"
-  if [[ -f "$IPV6_CONF_FILE" ]]; then
-    echo "     [OK]   $IPV6_CONF_FILE 存在"
-  else
-    echo "     [WARN] $IPV6_CONF_FILE 不存在 —— 重启后 IPv6 会恢复！"
-    issues=$((issues+1))
-  fi
+  local addr_count
+  addr_count=$(ip -6 addr show scope global 2>/dev/null | grep -c "inet6" || true)
 
-  # [3] 现存全局 IPv6 地址
-  echo -e "\n${Info} [3] 现存 IPv6 全局地址 (link-local fe80:: 是正常的，不列出):"
-  local addrs
-  addrs=$(ip -6 addr show scope global 2>/dev/null | grep -E "^\s+inet6" || true)
-  if [[ -z "$addrs" ]]; then
-    echo "     [OK]   无全局 IPv6 地址"
-  else
-    echo "     [WARN] 仍有以下地址残留:"
-    echo "$addrs" | sed 's/^/            /'
-    issues=$((issues+1))
-  fi
-
-  # [4] IPv6 路由
-  echo -e "\n${Info} [4] IPv6 路由 (link-local / 回环除外):"
-  local routes
-  routes=$(ip -6 route show 2>/dev/null | grep -v -E "^fe80|^::1|^unreachable" || true)
-  if [[ -z "$routes" ]]; then
-    echo "     [OK]   无 IPv6 全局路由"
-  else
-    echo "     [WARN] 仍有以下路由:"
-    echo "$routes" | sed 's/^/            /'
-    issues=$((issues+1))
-  fi
-
-  # [5] IPv6 socket 监听
-  echo -e "\n${Info} [5] 监听 IPv6 socket 的服务:"
+  local listener_count listener_hint=""
   if command -v ss >/dev/null 2>&1; then
-    local listeners
-    listeners=$(ss -tuln6 2>/dev/null | awk 'NR>1 {printf "%-6s %s\n", $1, $5}' | sort -u)
-    if [[ -z "$listeners" ]]; then
-      echo "     [OK]   无服务监听 IPv6"
-    else
-      echo "     [TIP]  以下服务仍占用 IPv6 socket (无流量进来，但 socket 未释放；"
-      echo "            如需清理请 systemctl restart 对应服务):"
-      echo "$listeners" | sed 's/^/            /'
+    listener_count=$(ss -tuln6 2>/dev/null | awk 'NR>1' | wc -l | tr -d ' ')
+    if (( listener_count > 0 )); then
+      # 提取前 3 个服务名（尝试从 ss 输出的进程列）
+      listener_hint=$(ss -tuln6 2>/dev/null | awk 'NR>1 {print $5}' | sort -u | head -3 | tr '\n' ' ')
     fi
   else
-    echo "     [SKIP] 缺少 ss 命令"
+    listener_count="?"
   fi
 
-  # [6] 内核模块
-  echo -e "\n${Info} [6] ipv6 内核模块:"
-  if lsmod 2>/dev/null | grep -q "^ipv6 "; then
-    echo "     [TIP]  ipv6 模块仍加载 (sysctl 禁用不卸载模块，属于正常现象)"
-    echo "            如需彻底卸载: 编辑 /etc/default/grub，GRUB_CMDLINE_LINUX 加 ipv6.disable=1"
-    echo "            然后 update-grub (或 grub2-mkconfig) 并重启"
+  local module_loaded=0
+  lsmod 2>/dev/null | grep -q "^ipv6 " && module_loaded=1
+
+  # 4 项核心状态
+  local m1 m2 m3 m4
+  if [[ "$all_v" == "1" && "$def_v" == "1" && "$lo_v" == "1" ]]; then
+    m1="\033[32m✓ 已禁用\033[0m"
   else
-    echo "     [OK]   ipv6 模块未加载 (最彻底状态)"
+    m1="\033[31m✗ 未禁用\033[0m   (all=${all_v}, default=${def_v}, lo=${lo_v})"
   fi
 
-  # [7] GRUB 参数
-  echo -e "\n${Info} [7] GRUB 内核参数:"
-  if grep -q "ipv6.disable=1" /proc/cmdline 2>/dev/null; then
-    echo "     [OK]   /proc/cmdline 含 ipv6.disable=1"
+  if (( conf_ok == 1 )); then
+    m2="\033[32m✓ 已持久化\033[0m  (${IPV6_CONF_FILE})"
   else
-    echo "     [TIP]  未通过 GRUB 禁用 (对本脚本的中转功能无影响)"
+    m2="\033[31m✗ 未持久化\033[0m  (重启后会恢复！)"
   fi
 
-  # 结论
-  echo -e "\n${Info} ============ 结论 ============"
-  if (( issues == 0 )); then
-    log "${Info} IPv6 已成功禁用，对网络转发功能已完全足够；无需重启"
-    log "${Tip} 如上面 [5] 列出了 IPv6 socket，重启对应服务可清理"
+  if [[ "$addr_count" == "0" ]]; then
+    m3="\033[32m✓ 无 IPv6 地址\033[0m"
   else
-    warn "发现 ${issues} 项问题，建议重新执行: sudo ${CMD_NAME} disable-ipv6"
+    m3="\033[33m⚠ 仍有 ${addr_count} 条 IPv6 地址\033[0m"
   fi
+
+  if [[ "$listener_count" == "0" ]]; then
+    m4="\033[32m✓ 无服务在 IPv6\033[0m"
+  elif [[ "$listener_count" == "?" ]]; then
+    m4="? (缺少 ss 命令，无法检查)"
+  else
+    m4="\033[33m${listener_count} 个服务占用 IPv6 socket\033[0m  (不影响外网访问)"
+  fi
+
+  # 一句话结论
+  local overall
+  if [[ "$all_v" == "1" && "$conf_ok" == "1" && "$addr_count" == "0" ]]; then
+    overall="\033[32m✓ IPv6 已完全禁用，且重启后保持\033[0m"
+  elif [[ "$all_v" == "1" && "$conf_ok" == "0" ]]; then
+    overall="\033[33m⚠ IPv6 当前已禁用，但重启后会恢复\033[0m —— 需要重新执行 [菜单 10]"
+  elif [[ "$all_v" != "1" && "$conf_ok" == "1" ]]; then
+    overall="\033[33m⚠ 有持久化配置但当前未生效\033[0m —— 执行 sysctl -p ${IPV6_CONF_FILE}"
+  else
+    overall="\033[31m✗ IPv6 处于启用状态\033[0m"
+  fi
+
+  # 输出
   echo ""
+  echo "  ╔═══════════════════════════════════════════════════════════╗"
+  echo "  ║              IPv6 状态检查                                  ║"
+  echo "  ╚═══════════════════════════════════════════════════════════╝"
+  echo ""
+  printf "    %-12s %b\n" "内核禁用:"  "$m1"
+  printf "    %-12s %b\n" "开机保持:"  "$m2"
+  printf "    %-12s %b\n" "当前地址:"  "$m3"
+  printf "    %-12s %b\n" "服务占用:"  "$m4"
+  echo ""
+  echo "  ─────────────────────────────────────────────────────────────"
+  printf "   一句话: %b\n" "$overall"
+  echo "  ─────────────────────────────────────────────────────────────"
+  echo ""
+
+  # 进阶信息，只在有问题或用户询问时展示，避免噪音
+  if [[ "$all_v" == "1" && "$conf_ok" == "1" && "$addr_count" == "0" ]]; then
+    if (( module_loaded == 1 )); then
+      echo "  说明: ipv6 内核模块仍加载 (属正常，sysctl 禁用不卸载模块)"
+      echo "        彻底卸载模块需在 GRUB 加 ipv6.disable=1 并重启，一般不必要"
+      echo ""
+    fi
+  fi
 }
 
 enable_ipv6() {
-  echo -e "${Info} 将启用 IPv6"
-  echo -e "${Tip} 当前状态: $(_ipv6_status)"
+  echo ""
+  echo "  ═══════════════════════════════════════════════"
+  echo "     即将执行: 启用 IPv6 (恢复)"
+  echo "  ═══════════════════════════════════════════════"
+  echo "     当前状态: $(_ipv6_status)"
+  echo "     动作    : 恢复 sysctl 参数、删除持久化配置"
+  echo "  ───────────────────────────────────────────────"
   local C
-  read -rp "$(echo -e ${Ask}) 确认启用? [y/N]: " C
-  [[ "$C" != "y" && "$C" != "Y" ]] && { log "${Tip} 已取消"; return; }
+  echo ""
+  read -rp "  >>> 请输入 y 并回车确认，其它任何输入(含回车)将取消: " C
+  echo ""
+  if [[ "$C" != "y" && "$C" != "Y" ]]; then
+    log "${Tip} 已取消 (你输入的是 '${C}')"
+    return
+  fi
 
   sysctl -w net.ipv6.conf.all.disable_ipv6=0     >/dev/null || die "sysctl 写入失败"
   sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null || die "sysctl 写入失败"
@@ -1115,44 +1215,50 @@ cli_del() {
 }
 
 ### ---------- 菜单 ----------
-_menu_status() {
-  local backend fwd fwd_v ipv6 persist count
+_menu_status_line() {
+  local backend fwd_v fwd ipv6 persist count
   backend=$(detect_backend)
   fwd_v=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo "?")
   case "$fwd_v" in 1) fwd="ON";; 0) fwd="OFF";; *) fwd="?";; esac
   ipv6=$(_ipv6_status)
   persist=$(_persistence_status | cut -d: -f1)
+  case "$persist" in
+    enabled)             persist="OK" ;;
+    installed_not_enabled) persist="装了未启用" ;;
+    not_installed)       persist="未装" ;;
+  esac
   count=$(_list_tags | wc -l | tr -d ' ')
-
-  printf "   %-14s : %s\n" "iptables 后端" "$backend"
-  printf "   %-14s : %s\n" "IPv4 转发"     "$fwd"
-  printf "   %-14s : %s\n" "IPv6"          "$ipv6"
-  printf "   %-14s : %s\n" "持久化服务"    "$persist"
-  printf "   %-14s : %s\n" "已管理规则"    "$count 条"
+  echo "后端=${backend}  转发=${fwd}  IPv6=${ipv6}  持久化=${persist}  规则=${count}条"
 }
 
 show_menu() {
   local installed_hint=""
-  [[ -x "${INSTALL_DIR}/${CMD_NAME}" ]] && installed_hint="  (cmd: ${CMD_NAME})"
+  [[ -x "${INSTALL_DIR}/${CMD_NAME}" ]] && installed_hint=" (系统命令: ${CMD_NAME})"
   echo ""
-  echo -e "  iptables 端口转发管理  [${VERSION}]${installed_hint}"
-  echo -e "  =========================================="
-  _menu_status
-  echo -e "  ------------------------------------------"
-  echo -e "   1. 安装 / 初始化 iptables"
-  echo -e "   2. 查看规则"
-  echo -e "   3. 添加规则"
-  echo -e "   4. 批量添加"
-  echo -e "   5. 删除规则  (支持批量: 1,3,5-8)"
-  echo -e "   6. 清空所有规则"
-  echo -e "   7. 导出规则"
-  echo -e "   8. 导入规则"
-  echo -e "   9. 安装为系统命令 (${CMD_NAME})"
-  echo -e "  ------------------------------------------  (较少用)"
-  echo -e "  10. 禁用 IPv6"
-  echo -e "  11. 启用 IPv6 (恢复)"
-  echo -e "  12. 检查 IPv6 状态"
-  echo -e "   q. 退出"
+  echo "  ╔═══════════════════════════════════════════════════════════╗"
+  echo "  ║  iptables 端口转发管理 ${VERSION}${installed_hint}"
+  echo "  ║  $(_menu_status_line)"
+  echo "  ╠═══════════════════════════════════════════════════════════╣"
+  echo "  ║  ── 安装 ──"
+  echo "  ║    1. 初始化 iptables         (首次使用必做)"
+  echo "  ║    9. 安装为系统命令 (${CMD_NAME})"
+  echo "  ║"
+  echo "  ║  ── 维护 ──"
+  echo "  ║    2. 查看规则"
+  echo "  ║    3. 添加规则"
+  echo "  ║    4. 批量添加"
+  echo "  ║    5. 删除规则                (支持批量: 1,3,5-8)"
+  echo "  ║    6. 清空所有规则"
+  echo "  ║    7. 导出规则"
+  echo "  ║    8. 导入规则"
+  echo "  ║"
+  echo "  ║  ── 其它 (较少用) ──"
+  echo "  ║   10. 禁用 IPv6"
+  echo "  ║   11. 启用 IPv6 (恢复)"
+  echo "  ║   12. 检查 IPv6 状态"
+  echo "  ║"
+  echo "  ║    q. 退出"
+  echo "  ╚═══════════════════════════════════════════════════════════╝"
   echo ""
 }
 
@@ -1182,7 +1288,8 @@ menu_loop() {
       *) log "${Error} 无效选择" ;;
     esac
     echo ""
-    read -rp "$(echo -e ${Tip}) 回车返回菜单..." _
+    echo "  ───────────────────────────────────────────────"
+    read -rp "  【操作完成】按【回车】返回主菜单 ...  " _
   done
 }
 
