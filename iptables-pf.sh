@@ -54,6 +54,16 @@ die()  { log "${Error} $*"; exit 1; }
 ### ---------- iptables 包装 (含锁等待) ----------
 ipt() { iptables -w 5 "$@"; }
 
+### ---------- 交互输入通用助手 ----------
+# 与 read -rp 行为等价，但显式处理 EOF 避免 set -e 意外退出
+_ask() {
+  local __prompt="$1" __var="$2" __in=""
+  # 与 read -rp 等价，但 || true 保证 set -e 下不会因 EOF 退出
+  printf '%s' "$__prompt" >&2 || true
+  IFS= read -r __in || __in=""
+  printf -v "$__var" '%s' "$__in" || true
+}
+
 ### ---------- 基础检查 ----------
 require_root() {
   [[ $EUID -eq 0 ]] || die "请使用 root 用户运行此脚本"
@@ -411,66 +421,101 @@ add_rules_multi_proto() {
 }
 
 interactive_add() {
-  echo -e "\n${Info} 添加端口转发规则"
-  echo "------------------------------------------"
+  echo ""
+  echo "  ═══════════════════════════════════════════════════════════"
+  echo "     添加端口转发规则  (共 6 步，可随时按 Ctrl+C 取消)"
+  echo "  ═══════════════════════════════════════════════════════════"
 
   local RIP RPORT LPORT MODE SNAT_IP PTYPE REMARK proto USER_IP OK
 
-  read -rp "$(echo -e ${Ask}) 转发目标 IP: " RIP
-  validate_ip "$RIP" || { log "${Error} IP 格式错误"; return 1; }
+  # ── 步骤 1/6 ──
+  echo ""
+  echo "  [步骤 1/6]  转发目标 IP  (要转到哪台机器? 例: 1.2.3.4)"
+  _ask "  >>> 请输入目标 IP: " RIP
+  validate_ip "$RIP" || { log "${Error} IP 格式错误: '${RIP}'"; return 0; }
 
-  read -rp "$(echo -e ${Ask}) 转发目标端口: " RPORT
-  validate_port "$RPORT" || { log "${Error} 端口非法"; return 1; }
+  # ── 步骤 2/6 ──
+  echo ""
+  echo "  [步骤 2/6]  转发目标端口  (对方服务端口，例: 22 / 80 / 443)"
+  _ask "  >>> 请输入目标端口: " RPORT
+  validate_port "$RPORT" || { log "${Error} 端口非法: '${RPORT}'"; return 1; }
 
-  read -rp "$(echo -e ${Ask}) 本机监听端口 (默认=$RPORT): " LPORT
+  # ── 步骤 3/6 ──
+  echo ""
+  echo "  [步骤 3/6]  本机监听端口  (对外暴露的端口，默认与目标端口相同 = $RPORT)"
+  _ask "  >>> 请输入 (直接回车用默认 $RPORT): " LPORT
   LPORT="${LPORT:-$RPORT}"
-  validate_port "$LPORT" || { log "${Error} 端口非法"; return 1; }
+  validate_port "$LPORT" || { log "${Error} 端口非法: '${LPORT}'"; return 1; }
 
-  echo -e "\n${Tip} SNAT 源 IP:"
-  echo "  1) 内网 IP (自动检测)"
-  echo "  2) 公网 IP (自动检测)"
-  read -rp "$(echo -e ${Ask}) 选择 [1-2] (默认 1): " MODE
+  # ── 步骤 4/6 ──
+  echo ""
+  echo "  [步骤 4/6]  SNAT 源 IP  (数据包出去时用哪个 IP 作源地址)"
+  echo "     选项 1 = 用内网 IP  (跨内网中转选此)"
+  echo "     选项 2 = 用公网 IP  (VPS 直接出公网时选此)"
+  _ask "  >>> 请输入 1 或 2 (直接回车默认 1): " MODE
   MODE="${MODE:-1}"
   if [[ "$MODE" == "2" ]]; then
     SNAT_IP=$(detect_wan_ip)
     if [[ -z "$SNAT_IP" ]]; then
-      warn "自动获取公网 IP 失败 (可能 DNS 异常或 443 出口被墙)"
-      warn "  请手工输入公网 IP，或按 Ctrl+C 取消后重新选模式 1 (用内网 IP)"
+      echo "  ⚠ 自动获取公网 IP 失败 (DNS 异常或 443 被墙)，请手动输入"
     else
-      echo -e "${Info} 检测到公网 IP: $SNAT_IP"
+      echo "  → 已自动检测到公网 IP: $SNAT_IP"
     fi
   else
     SNAT_IP=$(detect_lan_ip)
     if [[ -z "$SNAT_IP" ]]; then
-      warn "自动获取内网 IP 失败 (可能无默认路由)"
-      warn "  请手工输入本机内网 IP"
+      echo "  ⚠ 自动获取内网 IP 失败，请手动输入"
     else
-      echo -e "${Info} 检测到内网 IP: $SNAT_IP"
+      echo "  → 已自动检测到内网 IP: $SNAT_IP"
     fi
   fi
-  read -rp "$(echo -e ${Ask}) SNAT IP (回车使用上面的值): " USER_IP
+  _ask "  >>> SNAT IP (直接回车用上面检测到的值): " USER_IP
   [[ -n "$USER_IP" ]] && SNAT_IP="$USER_IP"
   validate_ip "$SNAT_IP" || { log "${Error} SNAT IP 非法: '${SNAT_IP:-空}'"; return 1; }
 
-  read -rp "$(echo -e ${Ask}) 协议 [1=TCP  2=UDP  3=TCP+UDP] (默认 3): " PTYPE
+  # ── 步骤 5/6 ──
+  echo ""
+  echo "  [步骤 5/6]  协议"
+  echo "     1 = TCP     (SSH/HTTP/HTTPS 等)"
+  echo "     2 = UDP     (DNS/游戏 等)"
+  echo "     3 = TCP+UDP (两者都转发)"
+  _ask "  >>> 请输入 1/2/3 (直接回车默认 3): " PTYPE
   PTYPE="${PTYPE:-3}"
-  case "$PTYPE" in 1) proto=tcp;; 2) proto=udp;; 3) proto=both;; *) log "${Error} 协议选择非法"; return 1;; esac
+  case "$PTYPE" in
+    1) proto=tcp;;
+    2) proto=udp;;
+    3) proto=both;;
+    *) log "${Error} 协议选择非法: '${PTYPE}'"; return 1;;
+  esac
 
-  read -rp "$(echo -e ${Ask}) 备注 (可选，用于识别用途): " REMARK
+  # ── 步骤 6/6 ──
+  echo ""
+  echo "  [步骤 6/6]  备注  (可留空，仅用于日后识别用途，支持中文空格)"
+  _ask "  >>> 请输入备注 (直接回车跳过): " REMARK
 
-  echo -e "\n${Info} 配置摘要:"
-  echo "  监听 : $SNAT_IP:$LPORT  ($proto)"
-  echo "  目标 : $RIP:$RPORT"
-  echo "  备注 : ${REMARK:-<无>}"
-  read -rp "$(echo -e ${Ask}) 确认添加? [Y/n]: " OK
-  [[ "$OK" == "n" || "$OK" == "N" ]] && { log "${Tip} 已取消"; return; }
+  # ── 配置确认 ──
+  echo ""
+  echo "  ───────────────────────────────────────────────────────────"
+  echo "     配置确认"
+  echo "  ───────────────────────────────────────────────────────────"
+  echo "     协议 : $proto"
+  echo "     监听 : $SNAT_IP:$LPORT   (对外开放)"
+  echo "     目标 : $RIP:$RPORT       (转发到)"
+  echo "     备注 : ${REMARK:-<无>}"
+  echo "  ───────────────────────────────────────────────────────────"
+  echo ""
+  _ask "  >>> 输入 y 后回车 = 添加；其它输入(含回车) = 取消: " OK
+  if [[ "$OK" != "y" && "$OK" != "Y" ]]; then
+    log "${Tip} 已取消 (你输入的是: '${OK}')"
+    return
+  fi
 
   local _rc=0
   add_rules_multi_proto "$LPORT" "$proto" "$RIP" "$RPORT" "$SNAT_IP" "$REMARK" || _rc=$?
   case "$_rc" in
-    0) save_rules ;;
+    0) save_rules; log "${Info} ✓ 添加成功" ;;
     2) log "${Tip} 规则已存在，未做修改" ;;
-    3) save_rules; log "${Info} 部分协议已存在，其余已新增并保存" ;;
+    3) save_rules; log "${Info} ✓ 部分协议已存在，其余已新增并保存" ;;
     *) log "${Error} 添加失败"; return 1 ;;
   esac
 }
@@ -488,8 +533,11 @@ interactive_batch_add() {
 
   local rules=() rule i=1 rejected=0
   local _lip _lport _rip _rport _rest
+  echo ""
+  echo "  [步骤 1/3]  逐行输入规则 (可粘贴多行)"
+  echo "  ───────────────────────────────────────────────────────────"
   while true; do
-    read -rp "  [${i}]> " rule
+    _ask "  [第${i}条] > " rule
     if [[ "$rule" == "q" || "$rule" == "Q" ]]; then
       log "${Tip} 已取消"; return 1
     fi
@@ -520,11 +568,16 @@ interactive_batch_add() {
   (( ${#rules[@]} == 0 )) && { log "${Tip} 无有效规则，返回菜单"; return; }
 
   local PTYPE proto REMARK OK
-  read -rp "$(echo -e ${Ask}) 协议 [1=TCP 2=UDP 3=TCP+UDP] (默认 3): " PTYPE
+  echo ""
+  echo "  [步骤 2/3]  选择协议 (对上面所有规则统一生效)"
+  echo "     1 = TCP   /   2 = UDP   /   3 = TCP+UDP"
+  _ask "  >>> 请输入 1/2/3 (直接回车默认 3): " PTYPE
   PTYPE="${PTYPE:-3}"
-  case "$PTYPE" in 1) proto=tcp;; 2) proto=udp;; 3) proto=both;; *) log "${Error} 协议选择非法"; return 1;; esac
+  case "$PTYPE" in 1) proto=tcp;; 2) proto=udp;; 3) proto=both;; *) log "${Error} 协议选择非法: '${PTYPE}'"; return 1;; esac
 
-  read -rp "$(echo -e ${Ask}) 统一备注 (可选): " REMARK
+  echo ""
+  echo "  [步骤 3/3]  统一备注 (对所有规则一起用同一个备注，可留空)"
+  _ask "  >>> 请输入备注 (直接回车跳过): " REMARK
 
   echo -e "\n${Info} 即将添加 ${#rules[@]} 条规则 (协议: $proto):"
   local r lip lport rest rip rport
@@ -534,8 +587,12 @@ interactive_batch_add() {
     rip="${rest%%:*}"; rport="${rest#*:}"
     echo "  $lip:$lport  ->  $rip:$rport"
   done
-  read -rp "$(echo -e ${Ask}) 确认添加所有规则? [Y/n]: " OK
-  [[ "$OK" == "n" || "$OK" == "N" ]] && { log "${Tip} 已取消"; return; }
+  echo ""
+  _ask "  >>> 输入 y 后回车 = 添加所有；其它输入(含回车) = 取消: " OK
+  if [[ "$OK" != "y" && "$OK" != "Y" ]]; then
+    log "${Tip} 已取消 (你输入的是: '${OK}')"
+    return
+  fi
 
   local added=0 dup=0 partial=0 fail=0 rc
   for r in "${rules[@]}"; do
@@ -715,8 +772,8 @@ interactive_delete() {
     _print_rules_table || { echo ""; return; }
     echo ""
     echo "  ───────────────────────────────────────────────────────────"
-    echo "     支持: 单个(3) / 范围(1-3) / 组合(1,3,5-8) / all / q 退出"
-    read -rp "  >>> 删除编号: " IDX
+    echo "     支持: 单个(3) / 范围(1-3) / 组合(1,3,5-8) / all(全部) / q(退出)"
+    _ask "  >>> 请输入要删除的编号: " IDX
     [[ "$IDX" == "q" || "$IDX" == "Q" ]] && break
     [[ -z "$IDX" ]] && continue
 
@@ -734,9 +791,9 @@ interactive_delete() {
     if [[ "$IDX" =~ [aA][lL][lL] ]] || (( sel_count == total )); then
       echo ""
       echo "  ⚠  即将删除全部 ${total} 行规则！"
-      read -rp "  >>> 请输入 y 并回车确认，其它任何输入(含回车)将取消: " C2
+      _ask "  >>> 输入 y 后回车 = 确认删除；其它输入(含回车) = 取消: " C2
       if [[ "$C2" != "y" && "$C2" != "Y" ]]; then
-        log "${Tip} 已取消"
+        log "${Tip} 已取消 (你输入的是: '${C2}')"
         continue
       fi
     fi
@@ -760,12 +817,18 @@ interactive_delete() {
 ### ---------- 清空 ----------
 clear_all() {
   local count; count=$(_list_tags | wc -l | tr -d ' ')
-  echo -e "${Warn} 这将清空所有由本脚本添加的转发规则！(当前共 ${count} 条)"
-  echo -e "${Warn} 为防手滑，请完整输入 'yes' 确认；其它任何输入均取消。"
+  echo ""
+  echo "  ═══════════════════════════════════════════════════════════"
+  echo "     ⚠ 危险操作: 清空所有转发规则"
+  echo "  ═══════════════════════════════════════════════════════════"
+  echo "     当前规则数: ${count} 条 (全部会被删除)"
+  echo "     为防手滑，需要完整输入 yes  (三个字母)"
+  echo "  ───────────────────────────────────────────────────────────"
+  echo ""
   local CONFIRM
-  read -rp "$(echo -e ${Ask}) 输入 yes 确认: " CONFIRM
+  _ask "  >>> 请输入 yes 后回车 = 确认清空；其它输入(含回车) = 取消: " CONFIRM
   if [[ "$CONFIRM" != "yes" ]]; then
-    log "${Tip} 已取消"
+    log "${Tip} 已取消 (你输入的是: '${CONFIRM}')"
     return
   fi
 
@@ -774,7 +837,11 @@ clear_all() {
   log "${Info} 已清空专用链内所有规则"
 
   local RM_HOOK
-  read -rp "$(echo -e ${Ask}) 是否同时移除主链钩子(-j $CHAIN_PRE / $CHAIN_POST)? [y/N]: " RM_HOOK
+  echo ""
+  echo "  是否同时移除主链钩子 (-j $CHAIN_PRE / $CHAIN_POST)?"
+  echo "     y = 移除 (下次添加规则前需重新初始化)"
+  echo "     n = 保留 (下次可直接添加规则，推荐)"
+  _ask "  >>> 请输入 y 或 n (直接回车默认 n): " RM_HOOK
   if [[ "$RM_HOOK" == "y" || "$RM_HOOK" == "Y" ]]; then
     while ipt -t nat -C PREROUTING  -j "$CHAIN_PRE"  2>/dev/null; do
       ipt -t nat -D PREROUTING  -j "$CHAIN_PRE"
@@ -877,13 +944,20 @@ disable_ipv6() {
   echo "     影响    : 清除所有 IPv6 地址、屏蔽 IPv6 流量"
   echo "     持久化  : 写入 $IPV6_CONF_FILE (重启后保持)"
   echo "     可恢复  : 菜单 11 或 sudo $CMD_NAME enable-ipv6"
-  echo "  ───────────────────────────────────────────────"
-  local C
   echo ""
-  read -rp "  >>> 请输入 y 并回车确认，其它任何输入(含回车)将取消: " C
+  echo "  ┌─────────────────────────────────────────────┐"
+  echo "  │  接下来要你输入:                             │"
+  echo "  │     输入 y 然后按【回车】  =>  执行禁用        │"
+  echo "  │     直接按【回车】或输其它  =>  取消           │"
+  echo "  └─────────────────────────────────────────────┘"
+  echo ""
+  local C=""
+  # 用 echo -n + read (不用 read -rp), 避开某些环境下多字节 prompt 不渲染的 bug
+  echo -n "  你的输入 > "
+  IFS= read -r C </dev/tty || C=""
   echo ""
   if [[ "$C" != "y" && "$C" != "Y" ]]; then
-    log "${Tip} 已取消 (你输入的是 '${C}')"
+    log "${Tip} 已取消 (你输入的是: '${C}')"
     return
   fi
 
@@ -1026,13 +1100,19 @@ enable_ipv6() {
   echo "  ═══════════════════════════════════════════════"
   echo "     当前状态: $(_ipv6_status)"
   echo "     动作    : 恢复 sysctl 参数、删除持久化配置"
-  echo "  ───────────────────────────────────────────────"
-  local C
   echo ""
-  read -rp "  >>> 请输入 y 并回车确认，其它任何输入(含回车)将取消: " C
+  echo "  ┌─────────────────────────────────────────────┐"
+  echo "  │  接下来要你输入:                             │"
+  echo "  │     输入 y 然后按【回车】  =>  执行启用        │"
+  echo "  │     直接按【回车】或输其它  =>  取消           │"
+  echo "  └─────────────────────────────────────────────┘"
+  echo ""
+  local C=""
+  echo -n "  你的输入 > "
+  IFS= read -r C </dev/tty || C=""
   echo ""
   if [[ "$C" != "y" && "$C" != "Y" ]]; then
-    log "${Tip} 已取消 (你输入的是 '${C}')"
+    log "${Tip} 已取消 (你输入的是: '${C}')"
     return
   fi
 
@@ -1233,63 +1313,68 @@ _menu_status_line() {
 
 show_menu() {
   local installed_hint=""
-  [[ -x "${INSTALL_DIR}/${CMD_NAME}" ]] && installed_hint=" (系统命令: ${CMD_NAME})"
+  [[ -x "${INSTALL_DIR}/${CMD_NAME}" ]] && installed_hint=" (cmd: ${CMD_NAME})"
   echo ""
-  echo "  ╔═══════════════════════════════════════════════════════════╗"
-  echo "  ║  iptables 端口转发管理 ${VERSION}${installed_hint}"
-  echo "  ║  $(_menu_status_line)"
-  echo "  ╠═══════════════════════════════════════════════════════════╣"
-  echo "  ║  ── 安装 ──"
-  echo "  ║    1. 初始化 iptables         (首次使用必做)"
-  echo "  ║    9. 安装为系统命令 (${CMD_NAME})"
-  echo "  ║"
-  echo "  ║  ── 维护 ──"
-  echo "  ║    2. 查看规则"
-  echo "  ║    3. 添加规则"
-  echo "  ║    4. 批量添加"
-  echo "  ║    5. 删除规则                (支持批量: 1,3,5-8)"
-  echo "  ║    6. 清空所有规则"
-  echo "  ║    7. 导出规则"
-  echo "  ║    8. 导入规则"
-  echo "  ║"
-  echo "  ║  ── 其它 (较少用) ──"
-  echo "  ║   10. 禁用 IPv6"
-  echo "  ║   11. 启用 IPv6 (恢复)"
-  echo "  ║   12. 检查 IPv6 状态"
-  echo "  ║"
-  echo "  ║    q. 退出"
-  echo "  ╚═══════════════════════════════════════════════════════════╝"
+  echo " iptables 端口转发管理  [${VERSION}]${installed_hint}"
+  echo " $(_menu_status_line)"
+  echo ""
+  echo " ————————————————————————————————————————"
+  echo " ── 安装 ──"
+  echo "   1. 初始化 iptables         (首次使用必做)"
+  echo "   9. 安装为系统命令 (${CMD_NAME})"
+  echo " ————————————————————————————————————————"
+  echo " ── 维护 ──"
+  echo "   2. 查看规则"
+  echo "   3. 添加规则"
+  echo "   4. 批量添加"
+  echo "   5. 删除规则                (支持批量: 1,3,5-8)"
+  echo "   6. 清空所有规则"
+  echo "   7. 导出规则"
+  echo "   8. 导入规则"
+  echo " ————————————————————————————————————————"
+  echo " ── 其它 (较少用) ──"
+  echo "  10. 禁用 IPv6"
+  echo "  11. 启用 IPv6 (恢复)"
+  echo "  12. 检查 IPv6 状态"
+  echo " ————————————————————————————————————————"
+  echo "   q. 退出"
   echo ""
 }
 
 menu_loop() {
-  local C f
+  local C f nm
   while true; do
     show_menu
-    read -rp "$(echo -e ${Ask}) 选择: " C
-    case "$C" in
-      1) install_and_init ;;
-      2) list_rules ;;
-      3) interactive_add ;;
-      4) interactive_batch_add ;;
-      5) interactive_delete ;;
-      6) clear_all ;;
-      7) read -rp "导出文件路径 (默认 /root/iptpf-rules.txt): " f
-         export_rules "${f:-/root/iptpf-rules.txt}" ;;
-      8) read -rp "导入文件路径: " f
-         [[ -n "$f" ]] && import_rules "$f" ;;
-      9) local nm
-         read -rp "命令名 (回车用默认 $CMD_NAME): " nm
-         install_self "${nm:-$CMD_NAME}" ;;
-      10) disable_ipv6 ;;
-      11) enable_ipv6 ;;
-      12) check_ipv6 ;;
-      q|Q) log "${Info} 再见"; exit 0 ;;
-      *) log "${Error} 无效选择" ;;
-    esac
+    C=""
+    # 关键: || true 防止 case 中函数返回非零触发 set -e 让脚本退出
+    _ask " >>> 请输入菜单编号 (1-12 或 q) 后按回车: " C || true
+    {
+      case "$C" in
+        1) install_and_init ;;
+        2) list_rules ;;
+        3) interactive_add ;;
+        4) interactive_batch_add ;;
+        5) interactive_delete ;;
+        6) clear_all ;;
+        7) echo ""
+           _ask " >>> 导出文件路径 (直接回车用默认 /root/iptpf-rules.txt): " f
+           export_rules "${f:-/root/iptpf-rules.txt}" ;;
+        8) echo ""
+           _ask " >>> 导入文件路径 (必填): " f
+           [[ -n "$f" ]] && import_rules "$f" ;;
+        9) echo ""
+           _ask " >>> 命令名 (直接回车用默认 $CMD_NAME): " nm
+           install_self "${nm:-$CMD_NAME}" ;;
+        10) disable_ipv6 ;;
+        11) enable_ipv6 ;;
+        12) check_ipv6 ;;
+        q|Q) log "${Info} 再见"; exit 0 ;;
+        *) log "${Error} 无效选择: '${C}'" ;;
+      esac
+    } || true
     echo ""
-    echo "  ───────────────────────────────────────────────"
-    read -rp "  【操作完成】按【回车】返回主菜单 ...  " _
+    echo " ————————————————————————————————————————"
+    _ask " 【操作完成】按【回车】返回主菜单 ... " _ || true
   done
 }
 
