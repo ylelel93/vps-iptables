@@ -58,9 +58,10 @@ ipt() { iptables -w 5 "$@"; }
 # 与 read -rp 行为等价，但显式处理 EOF 避免 set -e 意外退出
 _ask() {
   local __prompt="$1" __var="$2" __in=""
-  # 与 read -rp 等价，但 || true 保证 set -e 下不会因 EOF 退出
-  printf '%s' "$__prompt" >&2 || true
-  IFS= read -r __in || __in=""
+  # 关键: 写到 /dev/tty 直接送到终端设备, 绕过 stdout/stderr 缓冲
+  # (SSH 会话下, stderr 会被延迟刷新, 导致 read 阻塞时 prompt 看不见)
+  { printf '%s' "$__prompt" > /dev/tty; } 2>/dev/null || printf '%s' "$__prompt"
+  IFS= read -r __in </dev/tty 2>/dev/null || IFS= read -r __in || __in=""
   printf -v "$__var" '%s' "$__in" || true
 }
 
